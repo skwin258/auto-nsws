@@ -1,0 +1,3 @@
+# nixpacks.toml — 安裝中文字型與 fontconfig，讓 Sharp 疊字不再出現方塊
+[phases.setup]
+nixPkgs = ["nodejs_18", "fontconfig", "noto-fonts-cjk"]
