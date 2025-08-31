@@ -11,19 +11,25 @@ const sharp = require('sharp');
 const OpenAI = require('openai');
 
 /* =============================
-   ENV
+   ENV（已整合你提供的變數）
 ============================= */
 const {
   OPENAI_API_KEY,
   WP_URL,
   WP_USER,
   WP_APP_PASSWORD,
-  FEED_URLS = '',
+
+  FEED_URLS = '',                 // 你給的 Google News（NBA/MLB/娛樂）
+  WP_CATEGORY_ANALYSIS_ID = '',   // 你給的 7
+  WP_STATUS = 'draft',            // 你給的 draft
+  IMG_SIZE = '1536x1024',         // 你給的 1536x1024
   DEBUG = '0',
-  SCHEDULE = '1',
+
+  // 下面照舊，可保留或調整
+  SCHEDULE = '1',                 // 1=每天 08/12/20 自動跑；0=只跑一次
   WEB_ENABLE = '0',
   WEB_TOKEN = '',
-  PORT = '3000',
+  PORT = '3000'
 } = process.env;
 
 if (!OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
@@ -32,9 +38,10 @@ if (!OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
 }
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+const log = (...a) => (DEBUG === '1' ? console.log(...a) : void 0);
 
 /* =============================
-   常用工具
+   小工具
 ============================= */
 const STORE_FILE = path.resolve(__dirname, 'posted.json');
 function readStore() {
@@ -42,24 +49,18 @@ function readStore() {
   catch { return { items: [] }; }
 }
 function writeStore(data) {
-  try { fs.writeFileSync(STORE_FILE, JSON.stringify(data, null, 2)); }
-  catch {}
+  try { fs.writeFileSync(STORE_FILE, JSON.stringify(data, null, 2)); } catch {}
 }
 const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
-const log = (...a) => (DEBUG === '1' ? console.log(...a) : void 0);
 
 /* =============================
-   RSS：熱門來源（預設）
+   RSS：預設（若 FEED_URLS 沒填才用）
 ============================= */
 const DEFAULT_FEEDS = [
-  // Google News 台灣熱門（繁中）
   'https://news.google.com/rss?hl=zh-TW&gl=TW&ceid=TW:zh-Hant',
-  // BBC World
   'https://feeds.bbci.co.uk/news/world/rss.xml',
-  // Reuters World
-  'https://feeds.reuters.com/reuters/worldNews',
+  'https://feeds.reuters.com/reuters/worldNews'
 ];
-
 const parser = new Parser({
   headers: {
     'User-Agent': 'Mozilla/5.0',
@@ -68,7 +69,7 @@ const parser = new Parser({
 });
 
 /* =============================
-   WordPress API
+   WordPress API & 工具
 ============================= */
 const WP = axios.create({
   baseURL: WP_URL.replace(/\/+$/, ''),
@@ -94,9 +95,7 @@ async function wpAlreadyPostedByTitle(title) {
         .trim()
         .toLowerCase() === t
     );
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 async function uploadMedia(buffer, filename, mime) {
@@ -124,15 +123,10 @@ async function ensureTerm(tax, name) {
   throw new Error(`建立 ${tax} 失敗：${c.status} ${JSON.stringify(c.data).slice(0, 200)}`);
 }
 
-async function ensureCategories() {
+async function ensureDefaultCategories() {
   const names = ['即時新聞', '最新文章'];
   const ids = [];
   for (const n of names) ids.push(await ensureTerm('categories', n));
-  return ids;
-}
-async function ensureTags(tagNames) {
-  const ids = [];
-  for (const n of tagNames) ids.push(await ensureTerm('tags', n));
   return ids;
 }
 
@@ -194,28 +188,23 @@ async function writeLongArticle({ title, link, snippet }) {
   });
 
   let data;
-  try {
-    data = JSON.parse(resp.choices?.[0]?.message?.content || '{}');
-  } catch (e) {
-    throw new Error('GPT 回傳非 JSON，無法解析：' + e.message);
-  }
+  try { data = JSON.parse(resp.choices?.[0]?.message?.content || '{}'); }
+  catch (e) { throw new Error('GPT 回傳非 JSON，無法解析：' + e.message); }
   return data;
 }
 
 /* =============================
-   製圖（封面：有字，內文：無字）
+   製圖（封面：有字，內文：無字）— 支援 IMG_SIZE
 ============================= */
 function esc(s='') { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function wrapLines(t, n=12) {
-  const s=(t||'').trim();
-  if (!s) return [''];
+  const s=(t||'').trim(); if (!s) return [''];
   if (/\s/.test(s)) {
     const words=s.split(/\s+/); const lines=[]; let line='';
     for (const w of words) {
       if ((line + ' ' + w).trim().length <= n) line=(line?line+' ':'')+w;
       else { if (line) lines.push(line); line = w; }
-    }
-    if (line) lines.push(line); return lines;
+    } if (line) lines.push(line); return lines;
   }
   const lines=[]; for (let i=0;i<s.length;i+=n) lines.push(s.slice(i,i+n)); return lines;
 }
@@ -232,15 +221,17 @@ function buildHeroSVG(overlayText) {
   <text x="768" y="${startY}" text-anchor="middle"
         font-family="Noto Sans TC, Microsoft JhengHei, system-ui, -apple-system, Segoe UI, Arial"
         font-weight="900" font-size="${fontSize}"
-        fill="#ffffff" stroke="#000" stroke-width="8" paint-order="stroke">
-    ${tspans}
-  </text>
+        fill="#ffffff" stroke="#000" stroke-width="8" paint-order="stroke">${tspans}</text>
 </svg>`, 'utf8');
 }
 async function genImageBuffer(prompt, withText=false, overlayText='') {
-  const img = await client.images.generate({ model: 'gpt-image-1', size: '1536x1024', prompt });
-  const b64 = img.data[0].b64_json;
-  const base = Buffer.from(b64, 'base64');
+  async function gen(size) {
+    const img = await client.images.generate({ model: 'gpt-image-1', size, prompt });
+    return Buffer.from(img.data[0].b64_json, 'base64');
+  }
+  let base;
+  try { base = await gen(IMG_SIZE || '1536x1024'); }
+  catch { base = await gen('1024x1024'); } // 尺寸不支援時降級
   if (!withText) return base;
   const svg = buildHeroSVG(overlayText);
   return await sharp(base).composite([{ input: svg, blend: 'over' }]).png().toBuffer();
@@ -300,25 +291,42 @@ function buildContentJSONToBlocks({ heroUrl, heroCaption, inlineImgUrl, intro_pa
 }
 
 /* =============================
-   發文
+   發文（套用 WP_STATUS / WP_CATEGORY_ANALYSIS_ID）
 ============================= */
-async function postToWP({ title, content, excerpt, categories, tags, featured_media, focus_kw }) {
-  const payload = {
+async function postToWP({ title, content, excerpt, featured_media, focus_kw }) {
+  // 類別：若設定了 WP_CATEGORY_ANALYSIS_ID 就用它；否則建立預設類別
+  let categories = [];
+  const catIdNum = Number(WP_CATEGORY_ANALYSIS_ID);
+  if (Number.isFinite(catIdNum) && catIdNum > 0) {
+    categories = [catIdNum];
+  } else {
+    categories = await ensureDefaultCategories();
+  }
+
+  // 標籤：後面另行建立並塞 id
+  const payloadBase = {
     title,
-    status: 'draft',
+    status: WP_STATUS || 'draft',
     content,
     excerpt,
     categories,
-    tags,
     featured_media,
     meta: { rank_math_focus_keyword: focus_kw || '' },
   };
+
   const endpoints = ['/wp-json/wp/v2/posts', '/index.php?rest_route=/wp/v2/posts'];
   for (const ep of endpoints) {
-    const r = await WP.post(ep, payload, { headers: { 'Content-Type': 'application/json' } });
+    const r = await WP.post(ep, payloadBase, { headers: { 'Content-Type': 'application/json' } });
     if (r.status >= 200 && r.status < 300) return r.data;
   }
   throw new Error('發文失敗');
+}
+
+async function setPostTags(postId, tagNames) {
+  const tagIds = [];
+  for (const n of tagNames) tagIds.push(await ensureTerm('tags', n));
+  const r = await WP.post(`/wp-json/wp/v2/posts/${postId}`, { tags: tagIds }, { headers: { 'Content-Type': 'application/json' } });
+  if (!(r.status >= 200 && r.status < 300)) console.warn('⚠ 設定標籤失敗：', r.status);
 }
 
 /* =============================
@@ -350,19 +358,7 @@ async function runOnce() {
   const mediaA = await uploadMedia(heroImgBuf, `hero-${Date.now()}.png`, 'image/png');
   const mediaB = await uploadMedia(contentImgBuf, `inline-${Date.now()}.png`, 'image/png');
 
-  const catIds = await ensureCategories();
-  const tagResp = await client.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.5,
-    messages: [
-      { role: 'system', content: '給我 3 個適合的繁體中文標籤關鍵詞，純文字用逗號分隔。' },
-      { role: 'user', content: `主題：${catchyTitle}；焦點詞：${focusKeyword}` },
-    ],
-  });
-  const tagLine = tagResp.choices[0]?.message?.content || '';
-  const tagNames = tagLine.split(/[，,]/).map(s => s.trim()).filter(Boolean).slice(0,3);
-  const tagIds = await ensureTags(tagNames.length ? tagNames : [focusKeyword]);
-
+  // 內容區塊
   const contentBlocks = buildContentJSONToBlocks({
     heroUrl: mediaA.source_url,
     heroCaption: `▲ ${heroText}`,
@@ -371,17 +367,31 @@ async function runOnce() {
     sections: draft.sections || [],
   });
 
+  // 先建文
   const wpPost = await postToWP({
     title: catchyTitle,
     content: contentBlocks,
     excerpt: focusKeyword,
-    categories: catIds,
-    tags: tagIds,
     featured_media: mediaA.id,
     focus_kw: focusKeyword,
   });
 
-  // 記錄 hash（僅作輔助；真正去重靠 WP 查重）
+  // 再補標籤
+  try {
+    const tagResp = await client.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.5,
+      messages: [
+        { role: 'system', content: '給我 3 個適合的繁體中文標籤關鍵詞，純文字用逗號分隔。' },
+        { role: 'user', content: `主題：${catchyTitle}；焦點詞：${focusKeyword}` },
+      ],
+    });
+    const tagLine = tagResp.choices[0]?.message?.content || '';
+    const tagNames = tagLine.split(/[，,]/).map(s => s.trim()).filter(Boolean).slice(0,3);
+    if (tagNames.length) await setPostTags(wpPost.id, tagNames);
+  } catch (e) { console.warn('⚠ 產生標籤失敗：', e?.message || e); }
+
+  // 輔助紀錄
   const store = readStore();
   store.items.push({ hash, link: item.link, title: item.title, time: Date.now(), wp_id: wpPost.id });
   writeStore(store);
@@ -426,16 +436,13 @@ function bootHttp() {
 
 (async () => {
   if (SCHEDULE === '1') {
-    // 每天台北 08:00 / 12:00 / 20:00
     const cron = require('node-cron');
+    // 每天台北 08:00 / 12:00 / 20:00
     cron.schedule('0 8,12,20 * * *', () => { console.log('⏰ 觸發排程（Asia/Taipei）'); safeRun(); }, { timezone: 'Asia/Taipei' });
     console.log('▶ 已啟動排程：每日 08:00、12:00、20:00（Asia/Taipei）');
     if (WEB_ENABLE === '1') bootHttp();
   } else {
-    if (WEB_ENABLE === '1') {
-      console.log('▶ SCHEDULE=0：等待 /run 觸發（HTTP 已啟動）'); bootHttp();
-    } else {
-      await safeRun(); process.exit(0);
-    }
+    if (WEB_ENABLE === '1') { console.log('▶ SCHEDULE=0：等待 /run 觸發（HTTP 已啟動）'); bootHttp(); }
+    else { await safeRun(); process.exit(0); }
   }
 })().catch(e => { console.error('❌ 失敗：', e?.response?.data || e.message || e); process.exitCode = 1; });
