@@ -1,6 +1,10 @@
 // auto-news.js — 熱門新聞 → 3000字文章 → 兩張圖 → WP 草稿（RankMath焦點詞）
 // Node >= 18
 require('dotenv').config();
+
+// 讓 Node 解析域名時以 IPv4 優先，避免部分環境 IPv6 連線不穩
+try { require('dns').setDefaultResultOrder('ipv4first'); } catch {}
+
 const axios = require('axios');
 const Parser = require('rss-parser');
 const crypto = require('crypto');
@@ -10,26 +14,24 @@ const slugify = require('slugify');
 const sharp = require('sharp');
 const OpenAI = require('openai');
 
-/* =============================
-   ENV
-============================= */
 const {
   OPENAI_API_KEY,
   OPENAI_BASE_URL,     // 可選：自訂 API base（預設 https://api.openai.com/v1）
-  OPENAI_PROJECT,      // 可選：如果使用 sk-proj-… 時配合指定 project
+  OPENAI_PROJECT,      // 可選：sk-proj-… 時可設定 project id
+  OPENAI_MODEL = 'gpt-4o-mini',
 
   WP_URL,
   WP_USER,
   WP_APP_PASSWORD,
 
-  FEED_URLS = '',                 // 逗號分隔 RSS
-  WP_CATEGORY_ANALYSIS_ID = '',   // 例如 7
-  WP_STATUS = 'draft',            // draft / publish
-  IMG_SIZE = '1536x1024',         // 產圖尺寸
+  FEED_URLS = '',
+  WP_CATEGORY_ANALYSIS_ID = '',
+  WP_STATUS = 'draft',
+  IMG_SIZE = '1536x1024',
   DEBUG = '0',
 
-  SCHEDULE = '1',                 // 1=排程 08/12/20；0=啟動就跑一次
-  WEB_ENABLE = '0',               // 1=開 HTTP 觸發 /run?token=…
+  SCHEDULE = '1',
+  WEB_ENABLE = '0',
   WEB_TOKEN = '',
   PORT = '3000'
 } = process.env;
@@ -66,11 +68,31 @@ function explainError(e, label = '錯誤') {
   if (e?.code) parts.push(`code=${e.code}`);
   if (e?.response?.status) parts.push(`respStatus=${e.response.status}`);
   if (e?.response?.data) {
-    try { parts.push(`respData=${JSON.stringify(e.response.data).slice(0,300)}`); }
-    catch {}
+    try { parts.push(`respData=${JSON.stringify(e.response.data).slice(0,300)}`); } catch {}
   }
   if (e?.message) parts.push(`msg=${e.message}`);
   console.error(`✖ ${label}：` + (parts.join(' | ') || e));
+}
+
+// 重試與指數退避（針對連線錯、逾時等網路層錯誤）
+const RETRY_CODES = new Set(['ECONNRESET','ETIMEDOUT','ENETDOWN','ENETUNREACH','EAI_AGAIN']);
+function isConnError(err) {
+  const msg = (err?.message || '').toLowerCase();
+  return msg.includes('connection error') || RETRY_CODES.has(err?.code);
+}
+async function withRetry(fn, label='動作', tries=4, baseMs=600) {
+  let last;
+  for (let i=0;i<tries;i++) {
+    try { return await fn(); }
+    catch (e) {
+      last = e;
+      if (!isConnError(e) || i === tries-1) { explainError(e, label); throw e; }
+      const wait = Math.round(baseMs * Math.pow(2, i) * (1 + Math.random()*0.3));
+      console.warn(`⚠ ${label} 網路不穩，${i+1}/${tries} 次失敗，${wait}ms 後重試…`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw last;
 }
 
 /* =============================
@@ -180,6 +202,78 @@ async function pickOneFeedItem() {
 }
 
 /* =============================
+   OpenAI：SDK→REST 後備封裝
+============================= */
+const base = (OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/,'');
+function authHeaders() {
+  const h = { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' };
+  if (OPENAI_PROJECT) h['OpenAI-Project'] = OPENAI_PROJECT;
+  return h;
+}
+
+async function chatJSON(system, user, label='OpenAI 文字生成') {
+  return await withRetry(async () => {
+    // 先試 SDK
+    try {
+      const resp = await client.chat.completions.create({
+        model: OPENAI_MODEL,
+        temperature: 0.6,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      });
+      const text = resp.choices?.[0]?.message?.content || '{}';
+      return JSON.parse(text);
+    } catch (e) {
+      if (isConnError(e)) {
+        // 後備：REST
+        const body = {
+          model: OPENAI_MODEL,
+          temperature: 0.6,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+        };
+        const r = await fetch(base + '/chat/completions', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error(`REST /chat 失敗：${r.status} ${await r.text().then(t=>t.slice(0,300))}`);
+        const j = await r.json();
+        const text = j.choices?.[0]?.message?.content || '{}';
+        return JSON.parse(text);
+      }
+      throw e;
+    }
+  }, label);
+}
+
+async function imageB64(prompt, size, label='OpenAI 產圖') {
+  return await withRetry(async () => {
+    try {
+      const img = await client.images.generate({ model: 'gpt-image-1', size, prompt });
+      return img.data[0].b64_json;
+    } catch (e) {
+      if (isConnError(e)) {
+        const body = { model: 'gpt-image-1', size, prompt };
+        const r = await fetch(base + '/images/generations', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error(`REST /images 失敗：${r.status} ${await r.text().then(t=>t.slice(0,300))}`);
+        const j = await r.json();
+        return j.data?.[0]?.b64_json;
+      }
+      throw e;
+    }
+  }, label);
+}
+
+/* =============================
    文字生成（3000–3600 字）
 ============================= */
 async function writeLongArticle({ title, link, snippet }) {
@@ -192,25 +286,13 @@ async function writeLongArticle({ title, link, snippet }) {
 - 結尾 2 段收束觀點與延伸
 - 產出 JSON：{focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}
 - sections 必須剛好 6 個；paragraphs 為純文字陣列；請只輸出 JSON`;
-  const user = `來源標題：${title}
+  const usr = `來源標題：${title}
 來源連結：${link}
 來源摘要：${snippet || '(RSS 無摘要)'}
 請務必回傳 JSON，且盡量達到 3000–3600 字。`;
 
   try {
-    const resp = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.6,
-      messages: [
-        { role: 'system', content: sys },
-        { role: 'user', content: user },
-      ],
-    });
-
-    let data;
-    try { data = JSON.parse(resp.choices?.[0]?.message?.content || '{}'); }
-    catch (e) { throw new Error('GPT 回傳非 JSON，無法解析：' + e.message); }
-    return data;
+    return await chatJSON(sys, usr, 'OpenAI 文字生成');
   } catch (e) {
     explainError(e, 'OpenAI 文字生成失敗');
     throw e;
@@ -250,14 +332,11 @@ function buildHeroSVG(overlayText) {
 }
 
 async function genImageBuffer(prompt, withText=false, overlayText='') {
-  async function gen(size) {
-    const img = await client.images.generate({ model: 'gpt-image-1', size, prompt });
-    return Buffer.from(img.data[0].b64_json, 'base64');
-  }
   try {
-    let base;
-    try { base = await gen(IMG_SIZE || '1536x1024'); }
-    catch { base = await gen('1024x1024'); } // 尺寸不支援時降級
+    let b64;
+    try { b64 = await imageB64(prompt, IMG_SIZE || '1536x1024', 'OpenAI 產圖'); }
+    catch { b64 = await imageB64(prompt, '1024x1024', 'OpenAI 產圖(降級)'); }
+    const base = Buffer.from(b64, 'base64');
     if (!withText) return base;
     const svg = buildHeroSVG(overlayText);
     return await sharp(base).composite([{ input: svg, blend: 'over' }]).png().toBuffer();
@@ -326,11 +405,8 @@ function buildContentJSONToBlocks({ heroUrl, heroCaption, inlineImgUrl, intro_pa
 async function postToWP({ title, content, excerpt, featured_media, focus_kw }) {
   let categories = [];
   const catIdNum = Number(WP_CATEGORY_ANALYSIS_ID);
-  if (Number.isFinite(catIdNum) && catIdNum > 0) {
-    categories = [catIdNum];
-  } else {
-    categories = await ensureDefaultCategories();
-  }
+  if (Number.isFinite(catIdNum) && catIdNum > 0) categories = [catIdNum];
+  else categories = await ensureDefaultCategories();
 
   const payload = {
     title,
@@ -363,20 +439,13 @@ async function setPostTags(postId, tagNames) {
 async function preflight() {
   // OpenAI
   try {
-    const base = OPENAI_BASE_URL || 'https://api.openai.com/v1';
-    const r = await fetch(base.replace(/\/+$/, '') + '/models', {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    });
+    const r = await fetch(base + '/models', { method: 'GET', headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } });
     console.log('OpenAI /models:', r.status, r.statusText);
     if (!r.ok) {
       const t = await r.text();
       throw new Error(`OpenAI /models 非 2xx：${r.status} ${t.slice(0, 200)}`);
     }
-  } catch (e) {
-    explainError(e, 'OpenAI 連線測試失敗');
-    throw e;
-  }
+  } catch (e) { explainError(e, 'OpenAI 連線測試失敗'); throw e; }
 
   // RSS（不阻擋）
   try {
@@ -385,17 +454,13 @@ async function preflight() {
       const r = await fetch(firstFeed, { method: 'GET' });
       console.log('RSS 測試:', r.status, r.statusText);
     }
-  } catch (e) {
-    console.warn('⚠ RSS 測試警告：', e?.message || e);
-  }
+  } catch (e) { console.warn('⚠ RSS 測試警告：', e?.message || e); }
 
   // WP（不阻擋）
   try {
     const r = await WP.get('/wp-json');
     console.log('WP /wp-json:', r.status);
-  } catch (e) {
-    explainError(e, 'WP 連線測試失敗（不阻擋）');
-  }
+  } catch (e) { explainError(e, 'WP 連線測試失敗（不阻擋）'); }
 }
 
 /* =============================
@@ -443,17 +508,16 @@ async function runOnce() {
     focus_kw: focusKeyword,
   });
 
+  // 標籤（失敗不擋流程）
   try {
-    const tagResp = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.5,
-      messages: [
-        { role: 'system', content: '給我 3 個適合的繁體中文標籤關鍵詞，純文字用逗號分隔。' },
-        { role: 'user', content: `主題：${catchyTitle}；焦點詞：${focusKeyword}` },
-      ],
-    });
-    const tagLine = tagResp.choices[0]?.message?.content || '';
-    const tagNames = tagLine.split(/[，,]/).map(s => s.trim()).filter(Boolean).slice(0,3);
+    const tagData = await chatJSON(
+      '給我 3 個適合的繁體中文標籤關鍵詞，純文字用逗號分隔。',
+      `主題：${catchyTitle}；焦點詞：${focusKeyword}`,
+      'OpenAI 標籤生成'
+    );
+    const text = typeof tagData === 'string' ? tagData : '';
+    const line = text || '';
+    const tagNames = line.split(/[，,]/).map(s => s.trim()).filter(Boolean).slice(0,3);
     if (tagNames.length) await setPostTags(wpPost.id, tagNames);
   } catch (e) {
     explainError(e, '產生標籤失敗（略過）');
