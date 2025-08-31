@@ -2,7 +2,7 @@
 // Node >= 18
 require('dotenv').config();
 
-// 讓 Node 解析域名時以 IPv4 優先，避免部分環境 IPv6 連線不穩
+// 讓 Node 解析域名時以 IPv4 優先，避免某些環境 IPv6 連線不穩
 try { require('dns').setDefaultResultOrder('ipv4first'); } catch {}
 
 const axios = require('axios');
@@ -33,7 +33,9 @@ const {
   SCHEDULE = '1',
   WEB_ENABLE = '0',
   WEB_TOKEN = '',
-  PORT = '3000'
+  PORT = '3000',
+
+  HERO_TEXT = '1',     // 1=封面疊字；0=不疊字（字型未備妥可先關）
 } = process.env;
 
 if (!OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
@@ -117,7 +119,7 @@ const WP = axios.create({
   baseURL: WP_URL.replace(/\/+$/, ''),
   headers: {
     Authorization: 'Basic ' + Buffer.from(`${WP_USER}:${WP_APP_PASSWORD}`).toString('base64'),
-    'User-Agent': 'auto-news',
+    'User-Agent': 'auto-news-script',
   },
   validateStatus: () => true,
 });
@@ -132,7 +134,7 @@ async function uploadMedia(buffer, filename, mime) {
     maxContentLength: Infinity,
   });
   if (r.status >= 200 && r.status < 300) return r.data;
-  throw new Error('WP 媒體上傳失敗：' + r.status + ' ' + JSON.stringify(r.data).slice(0, 400));
+  throw new Error(`WP 媒體上傳失敗：${r.status} ${JSON.stringify(r.data).slice(0, 400)}`);
 }
 
 async function ensureTerm(tax, name) {
@@ -152,6 +154,13 @@ async function ensureDefaultCategories() {
   const ids = [];
   for (const n of names) ids.push(await ensureTerm('categories', n));
   return ids;
+}
+
+async function setPostTags(postId, tagNames) {
+  const tagIds = [];
+  for (const n of tagNames) tagIds.push(await ensureTerm('tags', n));
+  const r = await WP.post(`/wp-json/wp/v2/posts/${postId}`, { tags: tagIds }, { headers: { 'Content-Type': 'application/json' } });
+  if (!(r.status >= 200 && r.status < 300)) console.warn('⚠ 設定標籤失敗：', r.status);
 }
 
 async function wpAlreadyPostedByTitle(title) {
@@ -194,9 +203,7 @@ async function pickOneFeedItem() {
         if (await wpAlreadyPostedByTitle(item.title || '')) continue;
         return { feedUrl: url, item, hash: h };
       }
-    } catch (e) {
-      explainError(e, '讀取 RSS 失敗 ' + url);
-    }
+    } catch (e) { explainError(e, '讀取 RSS 失敗 ' + url); }
   }
   return null;
 }
@@ -251,22 +258,26 @@ async function chatJSON(system, user, label='OpenAI 文字生成') {
   }, label);
 }
 
-async function imageB64(prompt, size, label='OpenAI 產圖') {
+// 產生「純文字」回覆（不解析 JSON）
+async function chatPlain(system, user, label='OpenAI 純文字') {
   return await withRetry(async () => {
     try {
-      const img = await client.images.generate({ model: 'gpt-image-1', size, prompt });
-      return img.data[0].b64_json;
+      const resp = await client.chat.completions.create({
+        model: OPENAI_MODEL,
+        temperature: 0.5,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      });
+      return resp.choices?.[0]?.message?.content?.trim() || '';
     } catch (e) {
       if (isConnError(e)) {
-        const body = { model: 'gpt-image-1', size, prompt };
-        const r = await fetch(base + '/images/generations', {
-          method: 'POST',
-          headers: authHeaders(),
-          body: JSON.stringify(body),
+        const body = { model: OPENAI_MODEL, temperature: 0.5,
+          messages: [{ role: 'system', content: system }, { role: 'user', content: user }] };
+        const r = await fetch(base + '/chat/completions', {
+          method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
         });
-        if (!r.ok) throw new Error(`REST /images 失敗：${r.status} ${await r.text().then(t=>t.slice(0,300))}`);
+        if (!r.ok) throw new Error(`REST /chat 失敗：${r.status} ${await r.text().then(t=>t.slice(0,300))}`);
         const j = await r.json();
-        return j.data?.[0]?.b64_json;
+        return j.choices?.[0]?.message?.content?.trim() || '';
       }
       throw e;
     }
@@ -325,19 +336,45 @@ function buildHeroSVG(overlayText) {
 `<svg width="1536" height="1024" xmlns="http://www.w3.org/2000/svg">
   <rect x="0" y="0" width="1536" height="1024" fill="rgba(0,0,0,0.28)"/>
   <text x="768" y="${startY}" text-anchor="middle"
-        font-family="Noto Sans TC, Microsoft JhengHei, system-ui, -apple-system, Segoe UI, Arial"
+        font-family="Noto Sans CJK TC, Noto Sans TC, Microsoft JhengHei, PingFang TC, system-ui, -apple-system, Segoe UI, Arial"
         font-weight="900" font-size="${fontSize}"
-        fill="#ffffff" stroke="#000" stroke-width="8" paint-order="stroke">${tspans}</text>
+        fill="#ffffff" stroke="#000000" stroke-width="8" paint-order="stroke">${tspans}</text>
 </svg>`, 'utf8');
 }
 
+async function imageB64(prompt, size, label='OpenAI 產圖') {
+  return await withRetry(async () => {
+    try {
+      const img = await client.images.generate({ model: 'gpt-image-1', size, prompt });
+      return img.data[0].b64_json;
+    } catch (e) {
+      if (isConnError(e)) {
+        const body = { model: 'gpt-image-1', size, prompt };
+        const r = await fetch(base + '/images/generations', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error(`REST /images 失敗：${r.status} ${await r.text().then(t=>t.slice(0,300))}`);
+        const j = await r.json();
+        return j.data?.[0]?.b64_json;
+      }
+      throw e;
+    }
+  }, label);
+}
+
 async function genImageBuffer(prompt, withText=false, overlayText='') {
+  const overlayOff = (String(HERO_TEXT || '1') !== '1'); // 可關閉疊字
+
   try {
     let b64;
     try { b64 = await imageB64(prompt, IMG_SIZE || '1536x1024', 'OpenAI 產圖'); }
     catch { b64 = await imageB64(prompt, '1024x1024', 'OpenAI 產圖(降級)'); }
+
     const base = Buffer.from(b64, 'base64');
-    if (!withText) return base;
+    if (!withText || overlayOff) return base;
+
     const svg = buildHeroSVG(overlayText);
     return await sharp(base).composite([{ input: svg, blend: 'over' }]).png().toBuffer();
   } catch (e) {
@@ -400,14 +437,17 @@ function buildContentJSONToBlocks({ heroUrl, heroCaption, inlineImgUrl, intro_pa
 }
 
 /* =============================
-   發文
+   發文（分類：你的 ID + 即時新聞/最新文章）
 ============================= */
-async function postToWP({ title, content, excerpt, featured_media, focus_kw }) {
-  let categories = [];
-  const catIdNum = Number(WP_CATEGORY_ANALYSIS_ID);
-  if (Number.isFinite(catIdNum) && catIdNum > 0) categories = [catIdNum];
-  else categories = await ensureDefaultCategories();
+async function pickCategories() {
+  const baseIds = await ensureDefaultCategories(); // [即時新聞, 最新文章]
+  const extra = Number(WP_CATEGORY_ANALYSIS_ID);
+  if (Number.isFinite(extra) && extra > 0) baseIds.unshift(extra);
+  return Array.from(new Set(baseIds)); // 去重
+}
 
+async function postToWP({ title, content, excerpt, featured_media, focus_kw }) {
+  const categories = await pickCategories();
   const payload = {
     title,
     status: WP_STATUS || 'draft',
@@ -417,20 +457,12 @@ async function postToWP({ title, content, excerpt, featured_media, focus_kw }) {
     featured_media,
     meta: { rank_math_focus_keyword: focus_kw || '' },
   };
-
   const endpoints = ['/wp-json/wp/v2/posts', '/index.php?rest_route=/wp/v2/posts'];
   for (const ep of endpoints) {
     const r = await WP.post(ep, payload, { headers: { 'Content-Type': 'application/json' } });
     if (r.status >= 200 && r.status < 300) return r.data;
   }
   throw new Error('發文失敗');
-}
-
-async function setPostTags(postId, tagNames) {
-  const tagIds = [];
-  for (const n of tagNames) tagIds.push(await ensureTerm('tags', n));
-  const r = await WP.post(`/wp-json/wp/v2/posts/${postId}`, { tags: tagIds }, { headers: { 'Content-Type': 'application/json' } });
-  if (!(r.status >= 200 && r.status < 300)) console.warn('⚠ 設定標籤失敗：', r.status);
 }
 
 /* =============================
@@ -508,20 +540,20 @@ async function runOnce() {
     focus_kw: focusKeyword,
   });
 
-  // 標籤（失敗不擋流程）
+  // 標籤（失敗不擋流程）—— 純文字生成
   try {
-    const tagData = await chatJSON(
-      '給我 3 個適合的繁體中文標籤關鍵詞，純文字用逗號分隔。',
+    const tagLine = await chatPlain(
+      '給我 3 個適合的「繁體中文」標籤關鍵詞，純文字用逗號或頓號分隔，不要加引號、不要多餘說明。',
       `主題：${catchyTitle}；焦點詞：${focusKeyword}`,
       'OpenAI 標籤生成'
     );
-    const text = typeof tagData === 'string' ? tagData : '';
-    const line = text || '';
-    const tagNames = line.split(/[，,]/).map(s => s.trim()).filter(Boolean).slice(0,3);
+    const tagNames = (tagLine || '')
+      .split(/[，,]/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .slice(0, 3);
     if (tagNames.length) await setPostTags(wpPost.id, tagNames);
-  } catch (e) {
-    explainError(e, '產生標籤失敗（略過）');
-  }
+  } catch (e) { explainError(e, '產生標籤失敗（略過）'); }
 
   const store = readStore();
   store.items.push({ hash, link: item.link, title: item.title, time: Date.now(), wp_id: wpPost.id });
