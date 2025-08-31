@@ -1,10 +1,13 @@
 {
   "name": "auto-news",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "auto-news.js",
   "type": "commonjs",
   "scripts": {
     "start": "node auto-news.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "axios": "^1.7.2",
