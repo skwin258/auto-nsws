@@ -1,2 +1,2 @@
 [phases.setup]
-nixPkgs = ["nodejs_18", "fontconfig", "noto-fonts-cjk"]
+nixPkgs = ["nodejs_18", "fontconfig", "noto-fonts-cjk-sans-sans"]
