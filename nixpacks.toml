@@ -1,2 +1,13 @@
 [phases.setup]
-nixPkgs = ["nodejs_18", "fontconfig", "noto-fonts-cjk-sans-sans"]
+# 讓 Runtime 有字型與 fontconfig（nix 套件名稱）
+nixPkgs = [
+  "fontconfig",
+  "noto-fonts",
+  "noto-fonts-cjk-sans"
+]
+
+[phases.build]
+cmds = ["npm ci"]
+
+[start]
+cmd = "node auto-news.js"
