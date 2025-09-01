@@ -1,7 +1,6 @@
 {
   "name": "auto-news",
   "version": "1.0.0",
-  "type": "module",
   "main": "auto-news.js",
   "scripts": {
     "start": "node auto-news.js"
