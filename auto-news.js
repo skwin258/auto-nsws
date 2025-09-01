@@ -1,4 +1,6 @@
-// auto-news.js — 熱門新聞自動產文（不中斷版）+ 兩張圖 + RankMath + 可直接發佈
+// auto-news.js — 熱門新聞自動產文（更穩定：OpenAI 不中斷 + fallback 發佈）
+// 直接覆蓋你專案同名檔案
+
 require('dotenv').config();
 const axios = require('axios');
 const Parser = require('rss-parser');
@@ -11,23 +13,18 @@ const OpenAI = require('openai');
 
 const {
   OPENAI_API_KEY,
+  OPENAI_BASE_URL = 'https://api.openai.com/v1',
+  OPENAI_TIMEOUT_MS = '60000',
+
   WP_URL,
   WP_USER,
   WP_APP_PASSWORD,
 
-  // 如果你自訂 RSS，請用逗號分隔；若留空就用「綜合熱門」
   FEED_URLS = '',
-
-  // 可用來排除體育：例如 "MLB,NBA,體育,棒球,籃球"
   FEED_EXCLUDE = '',
 
-  // 0 = 立即執行一次
   START_DELAY_MIN = '0',
-
-  // publish = 直接發佈；draft = 草稿
   WP_STATUS = 'publish',
-
-  // RankMath 焦點關鍵字預設拿標題第一組詞
   IMG_SIZE = '1536x1024',
   DEBUG = '0',
 } = process.env;
@@ -45,7 +42,11 @@ function assertEnv() {
 }
 assertEnv();
 
-const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+const client = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+  baseURL: OPENAI_BASE_URL,
+  timeout: Number(OPENAI_TIMEOUT_MS) || 60000,
+});
 
 const parser = new Parser({
   headers: {
@@ -54,77 +55,62 @@ const parser = new Parser({
   },
 });
 
-// ---------- 工具 ----------
+// ---------- 小工具 ----------
 const STORE = path.join(__dirname, 'posted.json');
-function readStore() {
-  try { return JSON.parse(fs.readFileSync(STORE, 'utf8')); }
-  catch { return { items: [] }; }
-}
-function writeStore(data) {
-  fs.writeFileSync(STORE, JSON.stringify(data, null, 2));
-}
+function readStore() { try { return JSON.parse(fs.readFileSync(STORE, 'utf8')); } catch { return { items: [] }; } }
+function writeStore(data) { fs.writeFileSync(STORE, JSON.stringify(data, null, 2)); }
 const sha1 = s => crypto.createHash('sha1').update(String(s)).digest('hex');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-async function fetchWithRetry(doReq, { tries = 3, baseDelay = 800 } = {}) {
+async function fetchWithRetry(doReq, { tries = 3, baseDelay = 800, tag = '' } = {}) {
   let lastErr;
-  for (let i=0;i<tries;i++){
+  for (let i = 0; i < tries; i++) {
     try { return await doReq(); }
     catch (e) {
       lastErr = e;
       const code = e?.response?.status || e?.code || '';
-      if (DEBUG==='1') console.log(`⚠️ 請求失敗（第 ${i+1}/${tries} 次）`, code || e.message);
-      await sleep(baseDelay * (i+1));
+      if (DEBUG === '1') console.log(`⚠️ ${tag || 'req'} 失敗 (${i+1}/${tries})`, code || e.message);
+      await sleep(baseDelay * (i + 1));
     }
   }
   throw lastErr;
 }
 
-// ---------- OpenAI：健康檢查（不致命） ----------
+// ---------- OpenAI 健康檢查（不致命） ----------
 async function pingOpenAI() {
   try {
-    await fetchWithRetry(() => client.models.list(), { tries: 2, baseDelay: 500 });
-    if (DEBUG==='1') console.log('✅ OpenAI /models 200 OK');
+    await fetchWithRetry(() => client.models.list(), { tries: 2, baseDelay: 500, tag: 'ping /models' });
+    if (DEBUG === '1') console.log('✅ OpenAI /models OK');
     return true;
   } catch (e) {
-    console.warn('⚠️ OpenAI /models 測試失敗：', e?.message || e);
-    return false; // 只回傳 false，不中止流程
+    console.warn('⚠️ OpenAI /models 測試失敗（不中止）：', e?.message || e);
+    return false;
   }
 }
 
-// ---------- 產圖 ----------
-async function genImage(prompt, withText=false, overlay='') {
+// ---------- 產圖（可疊字） ----------
+async function genImage(prompt, withText = false, overlay = '') {
   const res = await fetchWithRetry(() => client.images.generate({
     model: 'gpt-image-1',
     size: IMG_SIZE,
     prompt,
-  }), { tries: 2, baseDelay: 800 });
+  }), { tries: 2, baseDelay: 1000, tag: 'images.generate' });
 
   const b64 = res.data[0].b64_json;
   const base = Buffer.from(b64, 'base64');
   if (!withText) return base;
 
-  // 疊字
-  function esc(s=''){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-  function wrapLines(t, n=12){
-    const s=(t||'').trim();
-    if(!s) return [''];
-    if(/\s/.test(s)){
-      const ws = s.split(/\s+/), lines=[], L=n;
-      let line='';
-      for(const w of ws){
-        if((line+' '+w).trim().length<=L) line=(line?line+' ':'')+w;
-        else { if(line) lines.push(line); line=w; }
-      }
-      if(line) lines.push(line);
-      return lines;
-    }else{
-      const out=[]; for(let i=0;i<s.length;i+=n) out.push(s.slice(i,i+n)); return out;
-    }
-  }
-  const lines = wrapLines(overlay, 12);
-  let fontSize = 86; if(lines.length>=4) fontSize=68; if(lines.length>=6) fontSize=56;
+  // 疊字 SVG
+  const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const wrap = (t, n=12) => {
+    t = (t||'').trim(); if(!t) return [''];
+    if(/\s/.test(t)){ const ws=t.split(/\s+/), lines=[]; let line='';
+      for(const w of ws){ if((line+' '+w).trim().length<=n) line=(line?line+' ':'')+w; else{ if(line) lines.push(line); line=w; } }
+      if(line) lines.push(line); return lines;
+    } else { const out=[]; for(let i=0;i<t.length;i+=n) out.push(t.slice(i,i+n)); return out; }
+  };
+  const lines = wrap(overlay, 12);
+  let fontSize = 86; if (lines.length>=4) fontSize=68; if (lines.length>=6) fontSize=56;
   const lineH = Math.round(fontSize*1.25);
   const total = lines.length*lineH;
   const startY = 512 - Math.round(total/2) + fontSize;
@@ -134,9 +120,8 @@ async function genImage(prompt, withText=false, overlay='') {
   <rect x="0" y="0" width="1536" height="1024" fill="rgba(0,0,0,0.28)"/>
   <text x="768" y="${startY}" text-anchor="middle"
         font-family="Noto Sans TC, PingFang TC, Microsoft JhengHei, system-ui, -apple-system, Segoe UI, Arial"
-        font-weight="900" font-size="${fontSize}"
-        fill="#fff" stroke="#000" stroke-width="8" paint-order="stroke">
-    ${wrapLines(overlay,12).map((ln,i)=>`<tspan x="768" dy="${i===0?0:lineH}">${esc(ln)}</tspan>`).join('')}
+        font-weight="900" font-size="${fontSize}" fill="#fff" stroke="#000" stroke-width="8" paint-order="stroke">
+    ${lines.map((ln,i)=>`<tspan x="768" dy="${i===0?0:lineH}">${esc(ln)}</tspan>`).join('')}
   </text>
 </svg>`, 'utf8');
 
@@ -162,7 +147,7 @@ async function uploadMedia(buffer, filename, mime) {
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
   });
-  if (DEBUG==='1') console.log('媒體上傳：', res.status, res.data?.id, res.data?.source_url);
+  if (DEBUG === '1') console.log('媒體上傳：', res.status, res.data?.id, res.data?.source_url);
   if (res.status >= 200 && res.status < 300) return res.data;
   throw new Error(`媒體上傳失敗：${res.status} ${JSON.stringify(res.data).slice(0,500)}`);
 }
@@ -180,7 +165,6 @@ async function ensureTerm(tax, name) {
 }
 
 async function ensureCategories() {
-  // 你可改成站上既有分類
   const names = ['即時新聞', '最新文章'];
   const ids = [];
   for (const n of names) ids.push(await ensureTerm('categories', n));
@@ -198,9 +182,7 @@ function h2Block(text) {
 <h2 class="wp-block-heading has-palette-color-7-color has-text-color has-background has-link-color has-large-font-size" style="background-color:#0a2a70;padding-top:0;padding-right:0;padding-bottom:0;padding-left:0;line-height:1.5"><strong>${text}</strong></h2>
 <!-- /wp:heading -->`;
 }
-function pBlock(text) {
-  return `<!-- wp:paragraph --><p>${text}</p><!-- /wp:paragraph -->`;
-}
+function pBlock(text) { return `<!-- wp:paragraph --><p>${text}</p><!-- /wp:paragraph -->`; }
 function heroFigure(src, caption) {
   return `<!-- wp:image {"sizeSlug":"full","linkDestination":"none"} -->
 <figure class="wp-block-image size-full"><img src="${src}" alt="${caption}"/><figcaption class="wp-element-caption"><strong>${caption}</strong></figcaption></figure>
@@ -226,7 +208,7 @@ ${pBlock('<strong>更多賽事推薦請加入官方LINE ID：<a href="https://li
 }
 function toBlocks({ heroUrl, heroCaption, inlineImgUrl, intro_paragraphs, sections }) {
   let blocks = '';
-  blocks += heroFigure(heroUrl, heroCaption);
+  if (heroUrl) blocks += heroFigure(heroUrl, heroCaption || '');
   blocks += pBlock('哈囉，大家好，我是文樂。');
   (intro_paragraphs || []).forEach(t => { blocks += pBlock(t); });
   let inlineUsed = false;
@@ -244,9 +226,8 @@ function toBlocks({ heroUrl, heroCaption, inlineImgUrl, intro_paragraphs, sectio
   return blocks;
 }
 
-// ---------- RSS 擷取 ----------
+// ---------- RSS ----------
 function defaultFeeds() {
-  // 綜合熱門（不是體育），你也可以自己指定 FEED_URLS
   return [
     'https://news.google.com/rss?hl=zh-TW&gl=TW&ceid=TW:zh-Hant',
     'https://news.google.com/rss/headlines/section/topic/NATION.zh-TW_TW?hl=zh-TW&gl=TW&ceid=TW:zh-Hant',
@@ -255,13 +236,11 @@ function defaultFeeds() {
     'https://news.google.com/rss/headlines/section/topic/ENTERTAINMENT.zh-TW_TW?hl=zh-TW&gl=TW&ceid=TW:zh-Hant',
   ];
 }
-
 function shouldExclude(title, excludeCsv) {
   if (!excludeCsv) return false;
   const ks = excludeCsv.split(',').map(s=>s.trim()).filter(Boolean);
-  return ks.some(k => title.includes(k));
+  return ks.some(k => (title||'').includes(k));
 }
-
 async function pickOneFeedItem() {
   const feeds = (FEED_URLS || '').split(',').map(s=>s.trim()).filter(Boolean);
   const FEEDS = feeds.length ? feeds : defaultFeeds();
@@ -286,7 +265,7 @@ async function pickOneFeedItem() {
   return null;
 }
 
-// ---------- 文字生成（3000–3600） ----------
+// ---------- 文字生成 + fallback ----------
 async function writeLongArticle({ title, link, snippet }) {
   const sys = `你是中文新聞專欄編輯。請根據「來源標題、摘要與連結」寫出 3000–3600 字、可發布的文章草稿：
 - 口吻中立、具可讀性、避免抄襲；改寫與延伸
@@ -295,9 +274,8 @@ async function writeLongArticle({ title, link, snippet }) {
 - 開頭固定：第一句「哈囉，大家好，我是文樂。」接著 2–3 段前言
 - 文章中段合適位置，段落末標「[內文圖]」（僅一次）
 - 結尾 2 段收束觀點與延伸
-- 請回傳 JSON：{focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}
-- sections 恰好 6 個，paragraphs 為陣列
-- 所有字串為純文字（不要 HTML）`;
+- 回傳 JSON：{focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}
+- sections 恰好 6 個，paragraphs 為陣列，內容全為純文字`;
 
   const user = `來源標題：${title}
 來源連結：${link}
@@ -311,16 +289,34 @@ async function writeLongArticle({ title, link, snippet }) {
       { role: 'system', content: sys },
       { role: 'user', content: user },
     ],
-  }), { tries: 3, baseDelay: 1200 });
+  }), { tries: 3, baseDelay: 1500, tag: 'chat.completions' });
 
-  let data;
-  try {
-    const text = resp.choices[0]?.message?.content || '{}';
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new Error('GPT 回傳非 JSON，無法解析：' + e.message);
-  }
-  return data;
+  const text = resp.choices[0]?.message?.content || '{}';
+  return JSON.parse(text);
+}
+
+// fallback：OpenAI 失敗時也能發佈
+function buildFallbackArticle({ title, link, snippet }) {
+  const kw = (title || '熱門新聞').split(/\s|，|、|：|:|—|-/)[0];
+  const t  = title || '最新焦點';
+  const intro = [
+    '哈囉，大家好，我是文樂。這是一則快訊整理，供讀者迅速掌握重點。',
+    `本文根據公開來源整理而成，原始連結：${link || '（來源缺失）'}。`,
+  ];
+  return {
+    focus_keyword: kw,
+    catchy_title: t,
+    hero_text: t,
+    intro_paragraphs: intro,
+    sections: [
+      { heading: '事件重點', paragraphs: [ snippet || '來源未提供摘要，後續將持續更新。', '[內文圖]' ] },
+      { heading: '背景脈絡', paragraphs: [ '本段提供事件沿革與背景，待更多資訊釐清後補充。' ] },
+      { heading: '目前進展', paragraphs: [ '相關單位或當事人仍在更新中。' ] },
+      { heading: '可能影響', paragraphs: [ '影響層面將視後續變化而定。' ] },
+      { heading: '延伸閱讀', paragraphs: [ `更多內容可參考來源：${link || '（來源缺失）'}` ] },
+      { heading: '結語', paragraphs: [ '以上內容為自動整理快訊，後續若有重大更新，將持續追蹤補充。' ] },
+    ],
+  };
 }
 
 // ---------- 發文 ----------
@@ -337,11 +333,11 @@ async function postToWP({ title, content, excerpt, categories, tags, featured_me
   };
   const endpoints = [
     '/wp-json/wp/v2/posts',
-    '/index.php?rest_route=/wp/v2/posts'
+    '/index.php?rest_route=/wp/v2/posts',
   ];
-  for (let i=0; i<endpoints.length; i++) {
-    const res = await WP.post(endpoints[i], payload, { headers: { 'Content-Type': 'application/json' } });
-    if (DEBUG==='1') console.log('WP 回應：', res.status, (res.data && res.data.id));
+  for (const ep of endpoints) {
+    const res = await WP.post(ep, payload, { headers: { 'Content-Type': 'application/json' } });
+    if (DEBUG === '1') console.log('WP 回應：', res.status, res.data?.id);
     if (res.status >= 200 && res.status < 300) return res.data;
   }
   throw new Error('發文失敗：' + JSON.stringify(payload).slice(0, 400));
@@ -351,18 +347,15 @@ async function postToWP({ title, content, excerpt, categories, tags, featured_me
 async function runOnce() {
   console.log('▶️ 開始一次任務');
 
-  // 健康檢查：失敗只警告，不中斷
+  // 健康檢查（不中斷）
   await pingOpenAI();
 
   const picked = await pickOneFeedItem();
-  if (!picked) {
-    console.log('⚠ 沒有找到新的 RSS 文章（或都被排除）');
-    return;
-  }
+  if (!picked) { console.log('⚠ 沒有新的 RSS 文章（或被排除）'); return; }
   const { item, hash, feedUrl } = picked;
-  if (DEBUG==='1') console.log('選到來源：', feedUrl, '→', item.title, item.link);
+  if (DEBUG === '1') console.log('選到來源：', feedUrl, '→', item.title, item.link);
 
-  // 產文
+  // 產文（有失敗就用 fallback）
   let draft;
   try {
     draft = await writeLongArticle({
@@ -371,28 +364,30 @@ async function runOnce() {
       snippet: item.contentSnippet || item.content || '',
     });
   } catch (e) {
-    console.error('OpenAI 產生內容失敗：', e.message || e);
-    return; // 不中斷整個容器，等待下次排程
+    console.warn('⚠️ OpenAI 產文失敗，改用 fallback：', e.message || e);
+    draft = buildFallbackArticle({
+      title: item.title || '',
+      link: item.link || '',
+      snippet: item.contentSnippet || item.content || '',
+    });
   }
 
   const focusKeyword = draft.focus_keyword || (item.title || '').split(' ')[0] || '熱門新聞';
   const catchyTitle = draft.catchy_title || item.title || '最新焦點';
-  const heroText = draft.hero_text || catchyTitle;
+  const heroText    = draft.hero_text || catchyTitle;
 
-  // 兩張圖
+  // 兩張圖（失敗不擋發文）
   let mediaA, mediaB;
   try {
     const basePrompt = `為以下主題產生一張寫實風格、能代表內容的新聞配圖，構圖清楚、對比強烈、適合做橫幅封面：主題：「${catchyTitle}」。不要商標、不要文字。`;
     const contentImgBuf = await genImage(basePrompt + ' 構圖適合內文插圖。', false);
     const heroImgBuf    = await genImage(basePrompt + ' 構圖適合封面。', true, heroText);
-    mediaA = await uploadMedia(heroImgBuf, `hero-${Date.now()}.png`, 'image/png');
+    mediaA = await uploadMedia(heroImgBuf,  `hero-${Date.now()}.png`,   'image/png');
     mediaB = await uploadMedia(contentImgBuf, `inline-${Date.now()}.png`, 'image/png');
   } catch (e) {
-    console.error('產圖或上傳媒體失敗：', e.message || e);
-    // 照樣發文，只是沒有圖片
+    console.warn('⚠️ 產圖或上傳媒體失敗（不擋發文）：', e.message || e);
   }
 
-  // 分類 / 標籤
   const catIds = await ensureCategories();
   let tagIds = [];
   try {
@@ -403,15 +398,14 @@ async function runOnce() {
         { role: 'system', content: '給我 3 個適合的繁體中文標籤關鍵詞，純文字用逗號分隔。' },
         { role: 'user', content: `主題：${catchyTitle}；焦點詞：${focusKeyword}` },
       ],
-    }), { tries: 2, baseDelay: 800 });
+    }), { tries: 2, baseDelay: 800, tag: 'gen tags' });
     const tagLine = tagResp.choices[0]?.message?.content || '';
-    const tagNames = tagLine.split(/[，,]/).map(s => s.trim()).filter(Boolean).slice(0,3);
+    const tagNames = tagLine.split(/[，,]/).map(s=>s.trim()).filter(Boolean).slice(0,3);
     tagIds = await ensureTags(tagNames.length ? tagNames : [focusKeyword]);
   } catch {
     tagIds = await ensureTags([focusKeyword]);
   }
 
-  // 內文區塊
   const blocks = toBlocks({
     heroUrl: mediaA?.source_url || '',
     heroCaption: `▲ ${heroText}`,
@@ -420,7 +414,6 @@ async function runOnce() {
     sections: draft.sections || [],
   });
 
-  // 發文
   const wpPost = await postToWP({
     title: catchyTitle,
     content: blocks,
@@ -433,7 +426,6 @@ async function runOnce() {
 
   console.log('✅ 已建立文章：', wpPost.id, wpPost.link || wpPost.guid?.rendered || '(no-link)');
 
-  // 去重紀錄
   const store = readStore();
   store.items.push({ hash, link: item.link, time: Date.now(), wp_id: wpPost.id });
   writeStore(store);
@@ -442,18 +434,12 @@ async function runOnce() {
 async function main() {
   console.log('Starting Container');
 
-  // 立即執行
   const delay = Number(START_DELAY_MIN || '0') || 0;
-  if (delay === 0) {
-    await runOnce();
-  } else {
-    setTimeout(runOnce, delay * 60 * 1000);
-  }
+  if (delay === 0) await runOnce();
+  else setTimeout(runOnce, delay * 60 * 1000);
 
-  // 保持進程（Railway 不中斷）
+  // 保持進程存活
   setInterval(() => {}, 1 << 30);
 }
 
-main().catch(e => {
-  console.error('❌ 主程序錯誤：', e.message || e);
-});
+main().catch(e => console.error('❌ 主程序錯誤：', e.message || e));
