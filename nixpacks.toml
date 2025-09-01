@@ -1,13 +1,9 @@
+# 讓 Nixpacks 安裝 fontconfig 與 Noto CJK 字型，避免疊字 SVG 顯示錯誤
 [phases.setup]
-# 讓 Runtime 有字型與 fontconfig（nix 套件名稱）
-nixPkgs = [
-  "fontconfig",
-  "noto-fonts",
-  "noto-fonts-cjk-sans"
-]
+nixPkgs = ["fontconfig", "noto-fonts", "noto-fonts-cjk-sans"]
 
 [phases.build]
 cmds = ["npm ci"]
 
-[start]
+[phases.start]
 cmd = "node auto-news.js"
