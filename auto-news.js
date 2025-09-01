@@ -1,16 +1,15 @@
-// auto-news.js — 熱門新聞（維持原版型：六段落）→ 兩張圖 → WordPress（分類、標籤、RankMath）
-// Node >= 18
+// auto-news.js — 熱門新聞 → 3000–3600字 → 兩張圖 → WordPress（分類、標籤、RankMath、排程/HTTP）
 require('dotenv').config();
 try { require('dns').setDefaultResultOrder('ipv4first'); } catch {}
 
-const axios   = require('axios');
-const Parser  = require('rss-parser');
-const crypto  = require('crypto');
-const fs      = require('fs');
-const path    = require('path');
+const axios = require('axios');
+const Parser = require('rss-parser');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const slugify = require('slugify');
-const sharp   = require('sharp');
-const OpenAI  = require('openai');
+const sharp = require('sharp');
+const OpenAI = require('openai');
 
 const {
   OPENAI_API_KEY,
@@ -23,25 +22,18 @@ const {
   WP_APP_PASSWORD,
 
   FEED_URLS = '',
-  FEED_FILTER_EXCLUDE = '娛樂,影劇,星座',   // 逗號分隔：排除字詞（標題含這些就跳過）
   WP_CATEGORY_ANALYSIS_ID = '',
-
-  // 直接發佈；若要草稿請設 WP_STATUS=draft
-  WP_STATUS = 'publish',
-
+  WP_STATUS = 'publish',           // 改回草稿：draft
   IMG_SIZE = '1536x1024',
-  DEBUG    = '0',
+  DEBUG = '0',
 
-  SCHEDULE   = '1',
+  SCHEDULE = '1',
   WEB_ENABLE = '0',
-  WEB_TOKEN  = '',
-  PORT       = '3000',
+  WEB_TOKEN = '',
+  PORT = '3000',
 
-  // 0=不疊字（建議，避免 fontconfig 警告）；1=封面疊字
-  HERO_TEXT = '0',
-
-  // 0=不插 CTA；1=插入 CTA（保留你的版型但預設關閉）
-  SHOW_CTA = '0',
+  HERO_TEXT = '1',                 // 1=封面加字；0=不加字
+  CTA_ENABLE = '1',                // 1=文末插入 CTA（含 QR 碼）
 } = process.env;
 
 if (!OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
@@ -50,12 +42,12 @@ if (!OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
 }
 
 const client = new OpenAI({
-  apiKey : OPENAI_API_KEY,
+  apiKey: OPENAI_API_KEY,
   baseURL: OPENAI_BASE_URL || undefined,
   project: OPENAI_PROJECT || undefined,
 });
 const base = (OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/,'');
-const log  = (...a) => (DEBUG === '1' ? console.log('[debug]', ...a) : void 0);
+const log = (...a)=> (DEBUG==='1'?console.log(...a):void 0);
 
 /* =============== util =============== */
 const STORE_FILE = path.resolve(__dirname, 'posted.json');
@@ -70,16 +62,14 @@ function explainError(e,label='錯誤'){
   if(e?.response?.status) parts.push(`resp=${e.response.status}`);
   if(e?.response?.data){ try{ parts.push(`data=${JSON.stringify(e.response.data).slice(0,250)}`);}catch{} }
   if(e?.message) parts.push(`msg=${e.message}`);
-  console.error(`✖ ${label}：` + (parts.join(' | ') || e));
+  console.error(`✖ ${label}：`+(parts.join(' | ')||e));
 }
-const NET_CODES = new Set(['ECONNRESET','ETIMEDOUT','ENETDOWN','ENETUNREACH','EAI_AGAIN']);
-const isConnErr = e => (e?.message||'').toLowerCase().includes('connection error') || NET_CODES.has(e?.code);
+const NETCODES=new Set(['ECONNRESET','ETIMEDOUT','ENETDOWN','ENETUNREACH','EAI_AGAIN']);
+const isConnErr=e=>(e?.message||'').toLowerCase().includes('connection error')||NETCODES.has(e?.code);
 async function withRetry(fn,label='動作',tries=4,baseMs=600){
-  let last;
-  for(let i=0;i<tries;i++){
+  let last; for(let i=0;i<tries;i++){
     try{ return await fn(); }
-    catch(e){
-      last=e;
+    catch(e){ last=e;
       if(!isConnErr(e) || i===tries-1){ explainError(e,label); throw e; }
       const wait=Math.round(baseMs*Math.pow(2,i)*(1+Math.random()*0.3));
       console.warn(`⚠ ${label} 第${i+1}/${tries}次失敗，${wait}ms 後重試…`); await new Promise(r=>setTimeout(r,wait));
@@ -88,28 +78,14 @@ async function withRetry(fn,label='動作',tries=4,baseMs=600){
 }
 
 /* =============== RSS =============== */
-// 一般熱門新聞：Google 要聞 / BBC World / Reuters World
 const DEFAULT_FEEDS = [
   'https://news.google.com/rss?hl=zh-TW&gl=TW&ceid=TW:zh-Hant',
   'https://feeds.bbci.co.uk/news/world/rss.xml',
   'https://feeds.reuters.com/reuters/worldNews'
 ];
-const parser = new Parser({
-  headers:{ 'User-Agent':'Mozilla/5.0', 'Accept':'application/rss+xml,application/xml;q=0.9,*/*;q=0.8' },
+const parser=new Parser({
+  headers:{'User-Agent':'Mozilla/5.0','Accept':'application/rss+xml,application/xml;q=0.9,*/*;q=0.8'},
 });
-
-// 標題清洗：移除《》《》等與尾巴網站名（—,–,-,| 後面）
-function normalizeTitle(t=''){
-  let s = (t || '').replace(/[《》「」『』【】]/g, '').trim();
-  s = s.split(/[\-|–—|｜]/)[0].trim();
-  return s;
-}
-function shouldSkipByFilter(title=''){
-  const bad = (FEED_FILTER_EXCLUDE||'').split(',').map(s=>s.trim()).filter(Boolean);
-  const t = title.toLowerCase();
-  return bad.some(w=>w && t.includes(w.toLowerCase()));
-}
-
 async function pickOneFeedItem(){
   const FEEDS=(FEED_URLS||'').split(',').map(s=>s.trim()).filter(Boolean);
   const sources=FEEDS.length?FEEDS:DEFAULT_FEEDS;
@@ -118,14 +94,10 @@ async function pickOneFeedItem(){
     try{
       const feed=await parser.parseURL(url);
       for(const item of (feed.items||[])){
-        const rawTitle = item.title || '';
-        if(!rawTitle) continue;
-        if(shouldSkipByFilter(rawTitle)) continue;
-
-        const key=item.link||item.guid||rawTitle||JSON.stringify(item);
+        const key=item.link||item.guid||item.title||JSON.stringify(item);
         const h=sha1(key);
         if(seen.has(h)) continue;
-        if(await wpAlreadyPostedByTitle(normalizeTitle(rawTitle))) continue;
+        if(await wpAlreadyPostedByTitle(item.title||'')) continue;
         return {feedUrl:url,item,hash:h};
       }
     }catch(e){ explainError(e,'讀取RSS失敗 '+url); }
@@ -133,20 +105,19 @@ async function pickOneFeedItem(){
   return null;
 }
 
-/* =============== OpenAI：文字 + JSON =============== */
+/* =============== OpenAI =============== */
 function authHeaders(){
-  const h={ Authorization:`Bearer ${OPENAI_API_KEY}`, 'Content-Type':'application/json' };
+  const h={Authorization:`Bearer ${OPENAI_API_KEY}`,'Content-Type':'application/json'};
   if(OPENAI_PROJECT) h['OpenAI-Project']=OPENAI_PROJECT;
   return h;
 }
 async function chatText(system,user,label='OpenAI'){
   return await withRetry(async ()=>{
     try{
-      const r=await client.chat.completions.create({
-        model:OPENAI_MODEL, temperature:0.6,
-        messages:[{role:'system',content:system},{role:'user',content:user}]
-      });
-      return r.choices?.[0]?.message?.content?.trim()||'';
+      const resp=await client.chat.completions.create({ model:OPENAI_MODEL, temperature:0.6, messages:[
+        {role:'system',content:system},{role:'user',content:user}
+      ]});
+      return resp.choices?.[0]?.message?.content?.trim()||'';
     }catch(e){
       if(isConnErr(e)){
         const body={model:OPENAI_MODEL,temperature:0.6,messages:[{role:'system',content:system},{role:'user',content:user}]};
@@ -160,86 +131,87 @@ async function chatText(system,user,label='OpenAI'){
 }
 function extractJSON(text){
   if(!text) return null;
+  const s=text.indexOf('{'), e=text.lastIndexOf('}');
+  if(s>-1 && e>s){ try{ return JSON.parse(text.slice(s,e+1)); }catch{} }
   const m=text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if(m){ try{ return JSON.parse(m[1]); }catch{} }
-  const s=text.indexOf('{'); const e=text.lastIndexOf('}');
-  if(s>-1 && e>s){ try{ return JSON.parse(text.slice(s,e+1)); }catch{} }
   try{ return JSON.parse(text); }catch{ return null; }
 }
 
-/* =============== 內容清理（移除網址/來源詞） =============== */
-const URL_RE = /\bhttps?:\/\/[^\s<>"'）)]+/gi;
-const WWW_RE = /\bwww\.[^\s<>"'）)]+/gi;
-// 不把「延伸閱讀」列入，因為它是你的固定段落
-const BAD_H2_RE   = /(來源|出處|參考資料|傳送門|原文|全文|更多|新聞來源)/i;
-const BAD_LINE_RE = /(來源|出處|參考資料|傳送門|新聞來源)[:：]/i;
+/* =============== 清理 & 標題去重 =============== */
+const URL_RE=/\bhttps?:\/\/[^\s<>"'）)]+/gi;
+const WWW_RE=/\bwww\.[^\s<>"'）)]+/gi;
+const BAD_H2_RE=/(來源|出處|延伸閱讀|參考資料|傳送門|原文|全文|更多)/i;
+const BAD_LINE_RE=/(來源|出處|延伸閱讀|參考資料|傳送門)[:：]/i;
 
-function stripUrls(s=''){ return s.replace(URL_RE,'').replace(WWW_RE,'').replace(/\s{2,}/g,' ').trim(); }
-function cleanParagraph(p){ return stripUrls((p||'').replace(BAD_LINE_RE,'').trim()); }
-function cleanHeading(h){ const t=(h||'').trim(); return BAD_H2_RE.test(t) ? '' : t; }
+const stripUrls=s=> (s||'').replace(URL_RE,'').replace(WWW_RE,'').replace(/\s{2,}/g,' ').trim();
+const cleanParagraph=p=> stripUrls((p||'').replace(BAD_LINE_RE,'').trim());
+const cleanHeading=h=>{ const t=(h||'').trim(); return BAD_H2_RE.test(t)?'':t; };
 
-function sanitizeDraft(draft){
-  const out = {
-    focus_keyword: stripUrls(draft.focus_keyword || ''),
-    catchy_title : stripUrls(draft.catchy_title  || ''),
-    hero_text    : stripUrls(draft.hero_text     || ''),
-    intro_paragraphs: (draft.intro_paragraphs||[]).map(cleanParagraph).filter(Boolean),
-    sections: [],
+function sanitizeDraft(d){
+  const out={
+    focus_keyword: stripUrls(d.focus_keyword||''),
+    catchy_title: stripUrls(d.catchy_title||''),
+    hero_text: stripUrls(d.hero_text||''),
+    intro_paragraphs:(d.intro_paragraphs||[]).map(cleanParagraph).filter(Boolean),
+    sections:[]
   };
-  (draft.sections||[]).forEach(sec=>{
-    const hh = cleanHeading(sec.heading);
+  (d.sections||[]).forEach(sec=>{
+    const hh=cleanHeading(sec.heading);
     if(!hh) return;
-    const pars = (sec.paragraphs||sec.paras||[]).map(cleanParagraph).filter(Boolean);
-    out.sections.push({ heading: hh, paragraphs: pars });
+    const pars=(sec.paragraphs||[]).map(cleanParagraph).filter(Boolean);
+    if(pars.length) out.sections.push({heading:hh,paragraphs:pars});
   });
   return out;
 }
 
-/* =============== 長文生成（維持你原本 6 段版型） =============== */
-async function writeLongArticle({title,link,snippet}){
-  const sys = `你是繁體中文（台灣）新聞編輯。請依「標題與摘要」寫出 3000–3600 字、可直接發布的文章草稿：
-- 完全用自己的話改寫與擴寫，避免抄襲；中立客觀、資訊密度高。
-- 全文**禁止**任何連結或網址（http、https、www、.com、.tw…），**禁止**出現「來源／出處／參考資料／傳送門」等字眼。
-- 固定 6 段：事件重點、背景脈絡、目前進展、可能影響、延伸閱讀、結語（小標中文字固定不改）。
-- 每段 2–4 段落；開頭固定第一句：「哈囉，大家好，我是文樂。」後接 2–3 段導言。
-- 在任一合適段落末尾只出現一次「[內文圖]」標記（供內文插圖插入）。
-- 僅輸出 JSON 主體：{
-  "focus_keyword": "...",
-  "catchy_title":  "...",
-  "hero_text":     "...",
-  "intro_paragraphs": ["..."],
-  "sections": [
-    {"heading":"事件重點","paragraphs":["..."]},
-    {"heading":"背景脈絡","paragraphs":["..."]},
-    {"heading":"目前進展","paragraphs":["..."]},
-    {"heading":"可能影響","paragraphs":["..."]},
-    {"heading":"延伸閱讀","paragraphs":["..."]},
-    {"heading":"結語","paragraphs":["..."]}
-  ]
-}`;
-
-  const usr = `標題：${title}
-摘要：${snippet || '(RSS 無摘要)'}
-（備註：不要把來源或連結寫進文章，六個小標必須使用上述固定名稱。）`;
-
-  let txt = await chatText(sys, usr, 'OpenAI 文字生成');
-  let data = extractJSON(txt);
-  if(!data){
-    const fixSys='只輸出有效 JSON；修正成 {focus_keyword,catchy_title,hero_text,intro_paragraphs,sections[]} 結構。';
-    data = extractJSON(await chatText(fixSys, txt, 'OpenAI JSON修復'));
-    if(!data) throw new Error('最終仍無法解析 JSON');
+function normalizeTitle(s){ return (s||'').toLowerCase().replace(/[^\u4e00-\u9fff\w]/g,''); }
+async function ensureUniqueTitle(srcTitle, modelTitle){
+  let t=modelTitle||'';
+  const a=normalizeTitle(srcTitle), b=normalizeTitle(t);
+  if(!t || a===b || a.includes(b) || b.includes(a)){
+    const sys='你是資深中文標題編輯，請產出一個**與提供標題不同**、中立、可讀性高、12–24字的中文新標題。只輸出標題文字。';
+    t = await chatText(sys, `提供標題：${srcTitle}`, 'OpenAI 標題改寫');
+    t = (t||'').replace(/\n/g,'').trim();
   }
-  data.catchy_title = normalizeTitle(data.catchy_title || title || '最新焦點');
+  return t || srcTitle;
+}
+
+/* =============== 長文生成 =============== */
+async function writeLongArticle({title,link,snippet}){
+  const sys=`你是繁體中文（台灣）新聞專欄編輯。請依「標題與摘要」寫出 3000–3600 字可直接發布的文章草稿：
+- 用自己的話改寫與延伸，資訊密度高、結構清楚，口吻中立。
+- 全文**禁止**出現「來源／出處／延伸閱讀／參考資料／傳送門」等字眼，**禁止**任何連結或網址（http、https、www、.com、.tw…）。
+- 文章分成 **6 段主題**，每段一個 h2 小標（不含井號），每段 2–4 段敘述；小標精煉、不可含網址或來源字眼。
+- 開頭第一句固定：「哈囉，大家好，我是文樂。」後接 2–3 段前言。
+- 正文僅一次在適當段落末尾放「[內文圖]」標記（協助我們插入內文圖片）。
+- 結尾 2 段做總結與延伸觀點。
+- 僅輸出 **JSON**：{focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}
+- 不要加任何解釋或程式碼框。`;
+
+  const usr=`標題：${title}
+摘要：${snippet || '(RSS 無摘要)'}`;
+
+  let txt; try{ txt=await chatText(sys, usr, 'OpenAI 文字生成(初次)'); }
+  catch(e){ explainError(e,'OpenAI 文字生成失敗(初次)'); throw e; }
+
+  let data=extractJSON(txt);
+  if(!data){
+    const fixSys='只輸出「有效 JSON」。結構必須為 {focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...] }。';
+    let fix=''; try{ fix=await chatText(fixSys, txt, 'OpenAI JSON修復'); }catch(e){ explainError(e,'OpenAI JSON修復失敗'); }
+    data=extractJSON(fix); if(!data) throw new Error('最終仍無法解析 JSON');
+  }
   return sanitizeDraft(data);
 }
 
-/* =============== 產圖（封面疊字可關閉） =============== */
+/* =============== 產圖（封面可疊字） =============== */
 function esc(s=''){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function wrapLines(t,n=12){
   const s=(t||'').trim(); if(!s) return [''];
   if(/\s/.test(s)){ const w=s.split(/\s+/), lines=[]; let line='';
     for(const x of w){ if((line+' '+x).trim().length<=n) line=(line?line+' ':'')+x; else{ if(line) lines.push(line); line=x; } }
-    if(line) lines.push(line); return lines; }
+    if(line) lines.push(line); return lines;
+  }
   const lines=[]; for(let i=0;i<s.length;i+=n) lines.push(s.slice(i,i+n)); return lines;
 }
 function buildHeroSVG(overlayText){
@@ -271,7 +243,7 @@ async function imageB64(prompt,size,label='OpenAI 產圖'){
   },label);
 }
 async function genImageBuffer(prompt,withText=false,overlayText=''){
-  const overlayOff = String(HERO_TEXT||'0')!=='1';
+  const overlayOff=String(HERO_TEXT||'1')!=='1';
   let b64;
   try{ b64=await imageB64(prompt, IMG_SIZE||'1536x1024'); }
   catch{ b64=await imageB64(prompt,'1024x1024'); }
@@ -284,13 +256,14 @@ async function genImageBuffer(prompt,withText=false,overlayText=''){
 /* =============== WP =============== */
 const WP = axios.create({
   baseURL: WP_URL.replace(/\/+$/,''),
-  headers: { Authorization: 'Basic '+Buffer.from(`${WP_USER}:${WP_APP_PASSWORD}`).toString('base64'), 'User-Agent':'auto-news-script' },
-  validateStatus: () => true,
+  headers: { Authorization:'Basic '+Buffer.from(`${WP_USER}:${WP_APP_PASSWORD}`).toString('base64'),
+             'User-Agent':'auto-news-script' },
+  validateStatus:()=>true,
 });
 async function uploadMedia(buf,filename,mime){
   const r=await WP.post('/wp-json/wp/v2/media', buf, {
-    headers:{ 'Content-Disposition':`attachment; filename="${filename}"`, 'Content-Type':mime },
-    maxBodyLength: Infinity, maxContentLength: Infinity,
+    headers:{'Content-Disposition':`attachment; filename="${filename}"`,'Content-Type':mime},
+    maxBodyLength:Infinity, maxContentLength:Infinity,
   });
   if(r.status>=200 && r.status<300) return r.data;
   throw new Error(`WP 媒體上傳失敗：${r.status} ${JSON.stringify(r.data).slice(0,300)}`);
@@ -314,12 +287,13 @@ async function ensureDefaultCategories(){
 async function pickCategories(){
   const baseIds=await ensureDefaultCategories();
   const extra=Number(WP_CATEGORY_ANALYSIS_ID);
-  if(Number.isFinite(extra) && extra>0) baseIds.unshift(extra);
+  if(Number.isFinite(extra)&&extra>0) baseIds.unshift(extra);
   return Array.from(new Set(baseIds));
 }
 async function postToWP({title,content,excerpt,featured_media,focus_kw}){
   const categories=await pickCategories();
-  const payload={ title, status:WP_STATUS||'publish', content, excerpt, categories, featured_media, meta:{ rank_math_focus_keyword:focus_kw||'' } };
+  const payload={ title, status:WP_STATUS||'publish', content, excerpt, categories, featured_media,
+                  meta:{ rank_math_focus_keyword:focus_kw||'' } };
   for(const ep of ['/wp-json/wp/v2/posts','/index.php?rest_route=/wp/v2/posts']){
     const r=await WP.post(ep,payload,{headers:{'Content-Type':'application/json'}});
     if(r.status>=200 && r.status<300) return r.data;
@@ -327,9 +301,8 @@ async function postToWP({title,content,excerpt,featured_media,focus_kw}){
   throw new Error('發文失敗');
 }
 async function setPostTags(postId, names){
-  if(!names?.length) return;
   const ids=[]; for(const n of names) ids.push(await ensureTerm('tags', n));
-  const r=await WP.post(`/wp-json/wp/v2/posts/${postId}`,{ tags: ids },{headers:{'Content-Type':'application/json'}});
+  const r=await WP.post(`/wp-json/wp/v2/posts/${postId}`,{tags:ids},{headers:{'Content-Type':'application/json'}});
   if(!(r.status>=200 && r.status<300)) console.warn('⚠ 設定標籤失敗：', r.status);
 }
 async function wpAlreadyPostedByTitle(title){
@@ -342,39 +315,60 @@ async function wpAlreadyPostedByTitle(title){
   }catch{ return false; }
 }
 
-/* =============== Gutenberg blocks（保留你的藍色小標） =============== */
-function h2Block(text){ return `<!-- wp:heading {"style":{"spacing":{"padding":{"top":"0","bottom":"0","left":"0","right":"0"}},"color":{"background":"#0a2a70"},"typography":{"lineHeight":"1.5"}},"textColor":"palette-color-7","fontSize":"large"} --><h2 class="wp-block-heading has-palette-color-7-color has-text-color has-background has-large-font-size" style="background-color:#0a2a70;line-height:1.5"><strong>${text}</strong></h2><!-- /wp:heading -->`; }
+/* =============== Gutenberg blocks（左對齊、薄背景） =============== */
+function h2Block(text){
+  return `<!-- wp:heading {"textAlign":"left","style":{"spacing":{"padding":{"top":"8px","right":"12px","bottom":"8px","left":"12px"}},"typography":{"lineHeight":"1.2"},"border":{"radius":"8px"},"color":{"background":"#0a2a70","text":"#ffffff"}},"className":"wl-section"} -->
+<h2 class="wp-block-heading has-text-align-left wl-section" style="background-color:#0a2a70;color:#ffffff;border-radius:8px;line-height:1.2;padding:8px 12px;"><strong>${text}</strong></h2>
+<!-- /wp:heading -->`;
+}
 function pBlock(text){ return `<!-- wp:paragraph --><p>${text}</p><!-- /wp:paragraph -->`; }
-function heroFigure(src,cap){ return `<!-- wp:image {"sizeSlug":"full","linkDestination":"none"} --><figure class="wp-block-image size-full"><img src="${src}" alt="${cap}"/><figcaption class="wp-element-caption"><strong>${cap}</strong></figcaption></figure><!-- /wp:image -->`; }
-function inlineFigure(src){ return `<!-- wp:image {"sizeSlug":"full","linkDestination":"none"} --><figure class="wp-block-image size-full"><img src="${src}" alt=""/></figure><!-- /wp:image -->`; }
-function ctaBlock(){ return `
+function heroFigure(src,cap){
+  return `<!-- wp:image {"sizeSlug":"full","linkDestination":"none"} -->
+<figure class="wp-block-image size-full"><img src="${src}" alt="${cap}"/><figcaption class="wp-element-caption"><strong>${cap}</strong></figcaption></figure>
+<!-- /wp:image -->`;
+}
+function inlineFigure(src){
+  return `<!-- wp:image {"sizeSlug":"full","linkDestination":"none"} -->
+<figure class="wp-block-image size-full"><img src="${src}" alt=""/></figure>
+<!-- /wp:image -->`;
+}
+function ctaBlock(){
+  if(String(CTA_ENABLE||'1')!=='1') return '';
+  return `
 ${h2Block('關注加入文樂運彩分析領取投注策略')}
-${pBlock('（此區塊預設關閉；若 SHOW_CTA=1 才會出現）')}
-`; }
-
+${pBlock('我是文樂，一個擁有八年看球及運彩經驗的分析師，2022-25賽季長期穩定勝率57%以上；MLB與NBA預測主推勝率更高。沒時間看球？沒關係，文樂幫您解析進階數據與事件背景，讓我們一起擊敗莊家！')}
+${pBlock('<strong>更多賽事推薦請加入官方 LINE：<a href="https://lin.ee/XJQjpHj">@912rdzda</a></strong>')}
+<!-- wp:image {"sizeSlug":"full","linkDestination":"none","align":"center","style":{"border":{"radius":"30px"}}} -->
+<figure class="wp-block-image aligncenter size-full has-custom-border"><img src="https://bc78999.com/wp-content/uploads/2024/08/M_gainfriends_2dbarcodes_GW-1.png" alt="" style="border-radius:30px"/></figure>
+<!-- /wp:image -->
+<!-- wp:paragraph {"align":"center"} --><p class="has-text-align-center">文樂運彩Line官方QR code</p><!-- /wp:paragraph -->`;
+}
 function buildContentJSONToBlocks({heroUrl,heroCaption,inlineImgUrl,intro_paragraphs,sections}){
-  let blocks=''; blocks+=heroFigure(heroUrl,heroCaption); blocks+=pBlock('哈囉，大家好，我是文樂。');
+  let blocks='';
+  blocks+=heroFigure(heroUrl,heroCaption);
+  blocks+=pBlock('哈囉，大家好，我是文樂。');
   (intro_paragraphs||[]).forEach(t=>{ if(t) blocks+=pBlock(t); });
   let used=false;
-  const order=['事件重點','背景脈絡','目前進展','可能影響','延伸閱讀','結語'];
-  order.forEach(wanted=>{
-    const sec=(sections||[]).find(s=>s.heading===wanted);
-    if(!sec) return;
+  (sections||[]).forEach((sec,idx)=>{
+    if(!sec?.heading || !sec?.paragraphs?.length) return;
     blocks+=h2Block(sec.heading);
-    (sec.paragraphs||[]).forEach((par,i)=>{
+    sec.paragraphs.forEach(par=>{
       if(!par) return;
       blocks+=pBlock(par);
-      if(!used && inlineImgUrl && wanted==='目前進展' && i>=0){ blocks+=inlineFigure(inlineImgUrl); used=true; }
+      if(!used && (/\[內文圖\]/.test(par) || idx===2)){
+        if(inlineImgUrl) blocks+=inlineFigure(inlineImgUrl);
+        used=true;
+      }
     });
   });
-  if(String(SHOW_CTA||'0')==='1') blocks+=ctaBlock();
+  blocks+=ctaBlock();
   return blocks;
 }
 
-/* =============== 自檢、主流程、HTTP =============== */
+/* =============== 主流程 =============== */
 async function preflight(){
   try{
-    const r=await fetch(base+'/models',{headers:{Authorization:`Bearer ${OPENAI_API_KEY}`}}); 
+    const r=await fetch(base+'/models',{headers:{Authorization:`Bearer ${OPENAI_API_KEY}`}});
     console.log('OpenAI /models:', r.status, r.statusText);
     if(!r.ok) throw new Error('OpenAI /models 非 2xx');
   }catch(e){ explainError(e,'OpenAI 連線測試失敗'); throw e; }
@@ -393,42 +387,44 @@ async function runOnce(){
   if(!picked){ console.log('⚠ 沒有新的 RSS 文章'); return; }
   const {item,hash,feedUrl}=picked; log('來源',feedUrl,'→',item.title);
 
-  const cleanTitle = normalizeTitle(item.title||'');
-  const draft = await writeLongArticle({ title: cleanTitle, link:item.link||'', snippet:item.contentSnippet||item.content||'' });
+  const draft=await writeLongArticle({
+    title:item.title||'', link:item.link||'', snippet:item.contentSnippet||item.content||''
+  });
 
-  const focusKeyword = draft.focus_keyword || cleanTitle.split(' ')[0] || '熱門新聞';
-  const catchyTitle  = normalizeTitle(draft.catchy_title || cleanTitle || '最新焦點');
-  const heroText     = draft.hero_text || catchyTitle;
+  // 確保標題改寫且不等於來源
+  const catchyTitle = await ensureUniqueTitle(item.title||'', draft.catchy_title||item.title||'');
+  const focusKeyword= draft.focus_keyword || (catchyTitle.split(' ')[0]) || '熱門新聞';
+  const heroText    = draft.hero_text || catchyTitle;
 
-  const basePrompt   = `以「${catchyTitle}」為主題，產生一張不含文字、無商標的寫實新聞示意圖，構圖清楚、對比自然、色彩中性。`;
-  const contentImgBuf= await genImageBuffer(basePrompt+' 構圖適合內文插圖。', false);
-  const heroImgBuf   = await genImageBuffer(basePrompt+' 構圖適合封面。', true, heroText);
+  const basePrompt=`為以下主題產生一張寫實風格、能代表內容的新聞配圖，構圖清楚、對比強烈、適合做橫幅封面：主題「${catchyTitle}」。不要商標、不要文字、避免不當內容。`;
+  const contentImgBuf=await genImageBuffer(basePrompt+' 構圖適合內文插圖。', false);
+  const heroImgBuf   =await genImageBuffer(basePrompt+' 構圖適合封面。', true, heroText);
 
-  const mediaA=await uploadMedia(heroImgBuf,   `hero-${Date.now()}.png`,   'image/png');
-  const mediaB=await uploadMedia(contentImgBuf,`inline-${Date.now()}.png`, 'image/png');
+  const mediaA=await uploadMedia(heroImgBuf, `hero-${Date.now()}.png`, 'image/png');
+  const mediaB=await uploadMedia(contentImgBuf, `inline-${Date.now()}.png`, 'image/png');
 
   const contentBlocks=buildContentJSONToBlocks({
     heroUrl:mediaA.source_url, heroCaption:`▲ ${heroText}`, inlineImgUrl:mediaB.source_url,
-    intro_paragraphs:draft.intro_paragraphs||[], sections:draft.sections||[],
+    intro_paragraphs:draft.intro_paragraphs||[], sections:draft.sections||[]
   });
 
   const wpPost=await postToWP({
-    title:catchyTitle, content:contentBlocks, excerpt:focusKeyword, featured_media:mediaA.id, focus_kw:focusKeyword,
+    title:catchyTitle, content:contentBlocks, excerpt:focusKeyword, featured_media:mediaA.id, focus_kw:focusKeyword
   });
 
-  // 標籤：用標題+焦點詞生成三個
+  // 標籤
   try{
     const tagLine=await chatText(
       '請用繁體中文回覆三個貼切的標籤，僅用中文逗號或頓號分隔，禁止加引號與任何說明。',
       `主題：${catchyTitle}；焦點詞：${focusKeyword}`,
       'OpenAI 標籤生成'
     );
-    const tags=(tagLine||'').split(/[，,、]/).map(s=>s.trim()).filter(Boolean).slice(0,3);
-    await setPostTags(wpPost.id, tags);
+    const tags=(tagLine||'').split(/[，,]/).map(s=>s.trim()).filter(Boolean).slice(0,3);
+    if(tags.length){ await setPostTags(wpPost.id, tags); console.log('✓ 已設定標籤：', tags.join(', ')); }
   }catch(e){ explainError(e,'產生標籤失敗（略過）'); }
 
   const store=readStore(); store.items.push({hash,link:item.link,title:item.title,time:Date.now(),wp_id:wpPost.id}); writeStore(store);
-  console.log((WP_STATUS||'publish')==='publish' ? '✅ 已發佈：' : '✅ 已建立草稿：', wpPost.id, wpPost.link || wpPost.guid?.rendered || '(no-link)');
+  console.log((WP_STATUS||'publish')==='publish'?'✅ 已發佈：':'✅ 已建立草稿：', wpPost.id, wpPost.link || wpPost.guid?.rendered || '(no-link)');
 }
 
 let isRunning=false;
