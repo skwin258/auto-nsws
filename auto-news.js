@@ -1,4 +1,4 @@
-// auto-news.js — 熱門新聞 → 3000–3600字 → 兩張圖 → WordPress（分類、標籤、RankMath、排程/HTTP）
+// auto-news.js — 熱門新聞 → 長文 → 兩張圖 → WP（預設沿用 RSS 原標題）
 // Node >= 18
 require('dotenv').config();
 try { require('dns').setDefaultResultOrder('ipv4first'); } catch {}
@@ -24,8 +24,7 @@ const {
 
   FEED_URLS = '',
   WP_CATEGORY_ANALYSIS_ID = '',
-  // 預設直接發佈；若要先存草稿，改成 'draft' 或在 Railway 設 WP_STATUS=draft
-  WP_STATUS = 'publish',
+  WP_STATUS = 'draft',         // ← 想直接發布就改 "publish"
   IMG_SIZE = '1536x1024',
   DEBUG = '0',
 
@@ -34,8 +33,8 @@ const {
   WEB_TOKEN = '',
   PORT = '3000',
 
-  // HERO_TEXT=1 表示封面圖加字；=0 不加字
-  HERO_TEXT = '1',
+  HERO_TEXT = '1',             // 1=封面疊字、0=不疊字
+  TITLE_MODE = 'rss',          // rss=用 RSS 原標題（建議）, ai=用模型標題, auto=優先模型
 } = process.env;
 
 if (!OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
@@ -81,8 +80,15 @@ async function withRetry(fn,label='動作',tries=4,baseMs=600){
   } throw last;
 }
 
+function normalizeTitle(t='') {
+  let s = String(t).trim();
+  s = s.replace(/^[「『《〈【(]+/, '').replace(/[」』》〉】)]+$/, '');
+  s = s.replace(/\s{2,}/g, ' ');
+  s = s.replace(/[。.!?]+$/, '');
+  return s.trim();
+}
+
 /* =============== RSS =============== */
-// 一般熱門新聞：Google 要聞 / BBC World / Reuters World
 const DEFAULT_FEEDS = [
   'https://news.google.com/rss?hl=zh-TW&gl=TW&ceid=TW:zh-Hant',
   'https://feeds.bbci.co.uk/news/world/rss.xml',
@@ -98,7 +104,7 @@ async function pickOneFeedItem(){
   for(const url of sources){
     try{
       const feed=await parser.parseURL(url);
-      for(const item of (feed.items||[])){
+      for(const item of feed.items||[]){
         const key=item.link||item.guid||item.title||JSON.stringify(item);
         const h=sha1(key);
         if(seen.has(h)) continue;
@@ -110,7 +116,7 @@ async function pickOneFeedItem(){
   return null;
 }
 
-/* =============== OpenAI 包裝：純文字 + 解析 JSON 安全化 =============== */
+/* =============== OpenAI =============== */
 function authHeaders(){
   const h={ Authorization:`Bearer ${OPENAI_API_KEY}`, 'Content-Type':'application/json' };
   if(OPENAI_PROJECT) h['OpenAI-Project']=OPENAI_PROJECT;
@@ -143,66 +149,34 @@ function extractJSON(text){
   try{ return JSON.parse(text); }catch{ return null; }
 }
 
-/* =============== 內容清理（移除網址 / 來源類小標） =============== */
-const URL_RE = /\bhttps?:\/\/[^\s<>"'）)]+/gi;
-const WWW_RE = /\bwww\.[^\s<>"'）)]+/gi;
-const BAD_H2_RE = /(來源|出處|延伸閱讀|參考資料|傳送門|原文|全文|更多)/i;
-const BAD_LINE_RE = /(來源|出處|延伸閱讀|參考資料|傳送門)[:：]/i;
-
-function stripUrls(s=''){ return s.replace(URL_RE,'').replace(WWW_RE,'').replace(/\s{2,}/g,' ').trim(); }
-function cleanParagraph(p){ return stripUrls((p||'').replace(BAD_LINE_RE,'').trim()); }
-function cleanHeading(h){ const t=(h||'').trim(); return BAD_H2_RE.test(t) ? '' : t; }
-
-function sanitizeDraft(draft){
-  const out = {
-    focus_keyword: stripUrls(draft.focus_keyword || ''),
-    catchy_title: stripUrls(draft.catchy_title || ''),
-    hero_text: stripUrls(draft.hero_text || ''),
-    intro_paragraphs: (draft.intro_paragraphs||[]).map(cleanParagraph).filter(Boolean),
-    sections: [],
-  };
-  (draft.sections||[]).forEach(sec=>{
-    const hh = cleanHeading(sec.heading);
-    if(!hh) return;
-    const pars = (sec.paragraphs||[]).map(cleanParagraph).filter(Boolean);
-    if(pars.length) out.sections.push({ heading: hh, paragraphs: pars });
-  });
-  // 保持你原本的 6 段結構（若清掉有缺，也不強制補；以生成為主）
-  return out;
-}
-
-/* =============== 長文生成（品質提升 + 禁止來源/網址） =============== */
+/* =============== 長文生成（中立新聞口吻） =============== */
 async function writeLongArticle({title,link,snippet}){
-  const sys = `你是繁體中文（台灣）新聞專欄編輯。請依「標題與摘要」寫出 3000–3600 字、可直接發布的文章草稿：
-- 用自己的話改寫與延伸，資訊密度高、結構清楚；維持中立口吻。
-- 全文**禁止**出現「來源／出處／延伸閱讀／參考資料／傳送門」等字眼，**禁止**任何連結或網址（http、https、www、.com、.tw…）。
-- 文章分成 **6 段主題**，每段一個 h2 小標（不含井號），每段 2–4 段敘述；小標精煉，不要含任何網址或來源字眼。
-- 開頭固定第一句：「哈囉，大家好，我是文樂。」後接 2–3 段前言。
-- 正文僅一次在適當段落末尾用「[內文圖]」標記（協助我們插入一張內文圖片）。
-- 收尾 2 段做總結與延伸觀點。
-- 僅輸出 **JSON**：{focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}
-- sections 必須剛好 6 個；paragraphs 為純文字陣列；不要加任何解釋或程式碼框。`;
+  const sys=`你是專業的繁體中文新聞編輯。依據「來源標題、摘要與連結」撰寫「可直接刊登」的長文（約 2400–3200 字）：
+- 完整中立、通順、非抄襲，合理延伸脈絡與背景
+- 分成 6 個主題段落，每段都有 1 個清楚的二級標題（不要加井號）
+- 每段 2–4 個段落，資料具體、避免主觀煽動
+- 正文適當處（僅一次）在段落末尾放「[內文圖]」標記，提醒系統插入內文圖片
+- 請只輸出有效 JSON：{focus_keyword, catchy_title, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}
+- 不得加入任何 code block / 說明文字`;
+  const usr=`來源標題：${title}
+來源連結：${link}
+來源摘要：${snippet || '(RSS 無摘要)'}`;
 
-  const usr = `標題：${title}
-摘要：${snippet || '(RSS 無摘要)'}
-（備註：不要把來源或連結寫進文章。）`;
-
-  // 第一次：拿純文字
   let txt;
   try { txt = await chatText(sys, usr, 'OpenAI 文字生成(初次)'); }
   catch(e){ explainError(e,'OpenAI 文字生成失敗(初次)'); throw e; }
 
-  // 抽 JSON；若失敗再修復一次
   let data = extractJSON(txt);
   if (!data) {
-    const fixSys='只輸出「有效 JSON」；輸入可能夾雜雜訊，請修成有效 JSON，結構必須為 {focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}。';
+    const fixSys='你是只輸出「有效 JSON」的修復器。輸入可能夾雜雜訊，請修成有效 JSON（結構 {focus_keyword, catchy_title, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}）。只能輸出 JSON 本體。';
     const fixUsr=txt;
-    let fix=''; try { fix = await chatText(fixSys, fixUsr, 'OpenAI JSON修復'); } catch(e){ explainError(e,'OpenAI JSON修復失敗'); }
-    data = extractJSON(fix);
+    let fixTxt='';
+    try { fixTxt = await chatText(fixSys, fixUsr, 'OpenAI JSON修復'); }
+    catch(e){ explainError(e,'OpenAI JSON修復失敗'); }
+    data = extractJSON(fixTxt);
     if(!data) throw new Error('最終仍無法解析 JSON');
   }
-  // 清理來源/網址等
-  return sanitizeDraft(data);
+  return data;
 }
 
 /* =============== 產圖（封面可關閉疊字） =============== */
@@ -279,7 +253,7 @@ async function ensureTerm(tax,name){
   throw new Error(`建立 ${tax} 失敗：${c.status} ${JSON.stringify(c.data).slice(0,200)}`);
 }
 async function ensureDefaultCategories(){
-  const names=['即時新聞','最新文章']; const ids=[];
+  const names=['即時新聞']; const ids=[];
   for(const n of names) ids.push(await ensureTerm('categories',n));
   return ids;
 }
@@ -291,7 +265,7 @@ async function pickCategories(){
 }
 async function postToWP({title,content,excerpt,featured_media,focus_kw}){
   const categories=await pickCategories();
-  const payload={ title, status:WP_STATUS||'publish', content, excerpt, categories, featured_media, meta:{ rank_math_focus_keyword:focus_kw||'' } };
+  const payload={ title, status:WP_STATUS||'draft', content, excerpt, categories, featured_media, meta:{ rank_math_focus_keyword:focus_kw||'' } };
   for(const ep of ['/wp-json/wp/v2/posts','/index.php?rest_route=/wp/v2/posts']){
     const r=await WP.post(ep,payload,{headers:{'Content-Type':'application/json'}});
     if(r.status>=200 && r.status<300) return r.data;
@@ -314,38 +288,33 @@ async function wpAlreadyPostedByTitle(title){
   }catch{ return false; }
 }
 
-/* =============== Gutenberg blocks =============== */
-function h2Block(text){ return `<!-- wp:heading {"style":{"spacing":{"padding":{"top":"0","bottom":"0","left":"0","right":"0"}},"elements":{"link":{"color":{"text":"var:preset|color|palette-color-7"}}},"color":{"background":"#0a2a70"},"typography":{"lineHeight":"1.5"}},"textColor":"palette-color-7","fontSize":"large"} --><h2 class="wp-block-heading has-palette-color-7-color has-text-color has-background has-link-color has-large-font-size" style="background-color:#0a2a70;line-height:1.5"><strong>${text}</strong></h2><!-- /wp:heading -->`; }
+/* =============== Gutenberg blocks（簡潔版） =============== */
+function h2Block(text){ return `<!-- wp:heading --><h2 class="wp-block-heading">${text}</h2><!-- /wp:heading -->`; }
 function pBlock(text){ return `<!-- wp:paragraph --><p>${text}</p><!-- /wp:paragraph -->`; }
-function heroFigure(src,cap){ return `<!-- wp:image {"sizeSlug":"full","linkDestination":"none"} --><figure class="wp-block-image size-full"><img src="${src}" alt="${cap}"/><figcaption class="wp-element-caption"><strong>${cap}</strong></figcaption></figure><!-- /wp:image -->`; }
+function heroFigure(src,cap){ return `<!-- wp:image {"sizeSlug":"full","linkDestination":"none"} --><figure class="wp-block-image size-full"><img src="${src}" alt="${cap}"/><figcaption class="wp-element-caption">${cap}</figcaption></figure><!-- /wp:image -->`; }
 function inlineFigure(src){ return `<!-- wp:image {"sizeSlug":"full","linkDestination":"none"} --><figure class="wp-block-image size-full"><img src="${src}" alt=""/></figure><!-- /wp:image -->`; }
-function ctaBlock(){ return `
-${h2Block('關注加入文樂運彩分析領取投注策略')}
-${pBlock('我是文樂，一個擁有八年看球及運彩經驗的分析師，2022-25賽季長期穩定勝率57%以上；MLB與NBA預測主推勝率更高。沒時間看球？沒關係，文樂幫您解析進階數據與事件背景，讓我們一起擊敗莊家！')}
-${pBlock('<strong>更多賽事推薦請加入官方 LINE：<a href="https://lin.ee/XJQjpHj">@912rdzda</a></strong>')}
-<!-- wp:image {"sizeSlug":"full","linkDestination":"none","align":"center","style":{"border":{"radius":"30px"}}} --><figure class="wp-block-image aligncenter size-full has-custom-border"><img src="https://bc78999.com/wp-content/uploads/2024/08/M_gainfriends_2dbarcodes_GW-1.png" alt="" style="border-radius:30px"/></figure><!-- /wp:image -->
-<!-- wp:paragraph {"align":"center"} --><p class="has-text-align-center">文樂運彩Line官方QR code</p><!-- /wp:paragraph -->`; }
 
 function buildContentJSONToBlocks({heroUrl,heroCaption,inlineImgUrl,intro_paragraphs,sections}){
-  let blocks=''; blocks+=heroFigure(heroUrl,heroCaption); blocks+=pBlock('哈囉，大家好，我是文樂。');
-  (intro_paragraphs||[]).forEach(t=>{ if(t) blocks+=pBlock(t); });
+  let blocks=''; blocks+=heroFigure(heroUrl,heroCaption);
+  (intro_paragraphs||[]).forEach(t=>blocks+=pBlock(t));
   let used=false;
   (sections||[]).forEach((sec,idx)=>{
-    if(!sec?.heading || !sec?.paragraphs?.length) return;
     blocks+=h2Block(sec.heading);
-    sec.paragraphs.forEach(par=>{
-      if(!par) return;
+    (sec.paragraphs||[]).forEach(par=>{
       blocks+=pBlock(par);
-      if(!used && (/\[內文圖\]/.test(par)||idx===2)){ if(inlineImgUrl) blocks+=inlineFigure(inlineImgUrl); used=true; }
+      if(!used && (/\[內文圖\]/.test(par)||idx===2)){
+        if(inlineImgUrl) blocks+=inlineFigure(inlineImgUrl);
+        used=true;
+      }
     });
   });
-  blocks+=ctaBlock(); return blocks;
+  return blocks;
 }
 
 /* =============== 自檢、主流程、HTTP =============== */
 async function preflight(){
   try{
-    const r=await fetch(base+'/models',{headers:{Authorization:`Bearer ${OPENAI_API_KEY}`}});
+    const r=await fetch(base+'/models',{headers:{Authorization:`Bearer ${OPENAI_API_KEY}`}}); 
     console.log('OpenAI /models:', r.status, r.statusText);
     if(!r.ok) throw new Error('OpenAI /models 非 2xx');
   }catch(e){ explainError(e,'OpenAI 連線測試失敗'); throw e; }
@@ -366,11 +335,20 @@ async function runOnce(){
 
   const draft=await writeLongArticle({ title:item.title||'', link:item.link||'', snippet:item.contentSnippet||item.content||'' });
 
-  const focusKeyword=draft.focus_keyword || (item.title||'').split(' ')[0] || '熱門新聞';
-  const catchyTitle=draft.catchy_title || item.title || '最新焦點';
-  const heroText=draft.hero_text || catchyTitle;
+  const focusKeyword = draft.focus_keyword || (item.title || '').split(/\s+/)[0] || '熱門新聞';
 
-  const basePrompt=`為以下主題產生一張寫實風格、能代表內容的新聞配圖，構圖清楚、對比強烈、適合做橫幅封面：主題「${catchyTitle}」。不要商標、不要文字、避免不當內容。`;
+  let catchyTitle;
+  if (TITLE_MODE === 'rss') {
+    catchyTitle = normalizeTitle(item.title || '最新焦點');
+  } else if (TITLE_MODE === 'ai') {
+    catchyTitle = normalizeTitle(draft.catchy_title || item.title || '最新焦點');
+  } else {
+    catchyTitle = normalizeTitle(draft.catchy_title || item.title || '最新焦點');
+  }
+
+  const heroText = draft.hero_text ? normalizeTitle(draft.hero_text) : catchyTitle;
+
+  const basePrompt=`為以下主題產生一張寫實風格、具有新聞感、清晰構圖的配圖，避免商標與文字：主題「${catchyTitle}」。`;
   const contentImgBuf=await genImageBuffer(basePrompt+' 構圖適合內文插圖。', false);
   const heroImgBuf=await genImageBuffer(basePrompt+' 構圖適合封面。', true, heroText);
 
@@ -378,7 +356,7 @@ async function runOnce(){
   const mediaB=await uploadMedia(contentImgBuf, `inline-${Date.now()}.png`, 'image/png');
 
   const contentBlocks=buildContentJSONToBlocks({
-    heroUrl:mediaA.source_url, heroCaption:`▲ ${heroText}`, inlineImgUrl:mediaB.source_url,
+    heroUrl:mediaA.source_url, heroCaption:heroText, inlineImgUrl:mediaB.source_url,
     intro_paragraphs:draft.intro_paragraphs||[], sections:draft.sections||[],
   });
 
@@ -386,7 +364,7 @@ async function runOnce(){
     title:catchyTitle, content:contentBlocks, excerpt:focusKeyword, featured_media:mediaA.id, focus_kw:focusKeyword,
   });
 
-  // 標籤（純文字）
+  // 標籤（不含說明，純中文逗號/頓號分隔）
   try{
     const tagLine=await chatText(
       '請用繁體中文回覆三個貼切的標籤，僅用中文逗號或頓號分隔，禁止加引號與任何說明。',
@@ -398,7 +376,7 @@ async function runOnce(){
   }catch(e){ explainError(e,'產生標籤失敗（略過）'); }
 
   const store=readStore(); store.items.push({hash,link:item.link,title:item.title,time:Date.now(),wp_id:wpPost.id}); writeStore(store);
-  console.log((WP_STATUS||'publish')==='publish' ? '✅ 已發佈：' : '✅ 已建立草稿：', wpPost.id, wpPost.link || wpPost.guid?.rendered || '(no-link)');
+  console.log('✅ 已建立文章：', wpPost.id, wpPost.link || wpPost.guid?.rendered || '(no-link)');
 }
 
 let isRunning=false;
