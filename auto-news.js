@@ -86,6 +86,10 @@ const DEFAULT_FEEDS = [
 const parser=new Parser({
   headers:{'User-Agent':'Mozilla/5.0','Accept':'application/rss+xml,application/xml;q=0.9,*/*;q=0.8'},
 });
+
+// 👉 政治黑名單（只用於 RSS 過濾，避免政治類新聞）
+const POLITICS_BLOCK = /(政治|選舉|總統|立法院|政黨|國會|議員|內閣|部長|罷免|公投|藍營|綠營|藍白|兩岸|統獨|外交|國防|國安|國臺辦|台獨|一國兩制|國民黨|民進黨|時力|基進|親民黨|民眾黨)/i;
+
 async function pickOneFeedItem(){
   const FEEDS=(FEED_URLS||'').split(',').map(s=>s.trim()).filter(Boolean);
   const sources=FEEDS.length?FEEDS:DEFAULT_FEEDS;
@@ -97,7 +101,13 @@ async function pickOneFeedItem(){
         const key=item.link||item.guid||item.title||JSON.stringify(item);
         const h=sha1(key);
         if(seen.has(h)) continue;
-        if(await wpAlreadyPostedByTitle(item.title||'')) continue;
+        if(await wpAlreadyPostedByTitle(item.title || '')) continue;
+
+        // 👉 新增：標題/摘要含政治關鍵字就跳過
+        const ttl = item.title || '';
+        const snip = item.contentSnippet || item.content || '';
+        if (POLITICS_BLOCK.test(ttl) || POLITICS_BLOCK.test(snip)) continue;
+
         return {feedUrl:url,item,hash:h};
       }
     }catch(e){ explainError(e,'讀取RSS失敗 '+url); }
@@ -177,6 +187,29 @@ async function ensureUniqueTitle(srcTitle, modelTitle){
   return t || srcTitle;
 }
 
+// 👉 新增：避免第一個小標題與開頭重複或含「我是文樂」
+function sameText(a, b) {
+  const x = (a || '').replace(/\s+/g, '').slice(0, 20);
+  const y = (b || '').replace(/\s+/g, '').slice(0, 20);
+  return x && y && (x === y || x.includes(y) || y.includes(x));
+}
+function adjustFirstHeading(d) {
+  if (!d?.sections?.length) return d;
+  const helloRe = /哈囉，?大家好，?我是文樂/;
+  const introFirst = (d.intro_paragraphs?.[0] || '').trim();
+  const first = d.sections[0];
+
+  if (!first.heading || helloRe.test(first.heading) || sameText(first.heading, introFirst)) {
+    first.heading = '事件重點';
+  }
+  if (Array.isArray(first.paragraphs) && first.paragraphs.length) {
+    first.paragraphs = first.paragraphs
+      .map(p => (p || '').replace(helloRe, '').trim())
+      .filter(Boolean);
+  }
+  return d;
+}
+
 /* =============== 長文生成 =============== */
 async function writeLongArticle({title,link,snippet}){
   const sys=`你是繁體中文（台灣）新聞專欄編輯。請依「標題與摘要」寫出 3000–3600 字可直接發布的文章草稿：
@@ -197,11 +230,12 @@ async function writeLongArticle({title,link,snippet}){
 
   let data=extractJSON(txt);
   if(!data){
-    const fixSys='只輸出「有效 JSON」。結構必須為 {focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...] }。';
+    const fixSys='只輸出「有效 JSON」。結構必須為 {focus_keyword, catchy_title, hero_text, sections:[{heading, paragraphs:[...]}], intro_paragraphs:[...]}。';
     let fix=''; try{ fix=await chatText(fixSys, txt, 'OpenAI JSON修復'); }catch(e){ explainError(e,'OpenAI JSON修復失敗'); }
     data=extractJSON(fix); if(!data) throw new Error('最終仍無法解析 JSON');
   }
-  return sanitizeDraft(data);
+  // 👉 只在清理後補強第一個小標題
+  return adjustFirstHeading(sanitizeDraft(data));
 }
 
 /* =============== 產圖（封面可疊字） =============== */
