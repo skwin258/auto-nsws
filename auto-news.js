@@ -1,4 +1,4 @@
-// auto-news.js — 熱門新聞（ETtoday 熱門優先）→ 3000–3600字 → 兩張圖 → WordPress（分類、標籤、RankMath、排程/HTTP）
+// auto-news.js — 熱門新聞 → 3000–3600字 → 兩張圖 → WordPress（分類、標籤、RankMath、排程/HTTP）
 require('dotenv').config();
 try { require('dns').setDefaultResultOrder('ipv4first'); } catch {}
 
@@ -23,7 +23,7 @@ const {
 
   FEED_URLS = '',
   WP_CATEGORY_ANALYSIS_ID = '',
-  WP_STATUS = 'publish',          // 改草稿：'draft'
+  WP_STATUS = 'publish',           // 改回草稿：draft
   IMG_SIZE = '1536x1024',
   DEBUG = '0',
 
@@ -32,11 +32,8 @@ const {
   WEB_TOKEN = '',
   PORT = '3000',
 
-  HERO_TEXT = '1',                // 1=封面加字；0=不加字
-  CTA_ENABLE = '1',               // 1=文末插入 CTA（含 QR 碼）
-
-  // 逗號分隔，可自行加字；下方有預設政治黑名單（會與此合併）
-  KEYWORD_BLACKLIST = '',
+  HERO_TEXT = '1',                 // 1=封面加字；0=不加字
+  CTA_ENABLE = '1',                // 1=文末插入 CTA（含 QR 碼）
 } = process.env;
 
 if (!OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
@@ -49,7 +46,7 @@ const client = new OpenAI({
   baseURL: OPENAI_BASE_URL || undefined,
   project: OPENAI_PROJECT || undefined,
 });
-const base = (OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
+const base = (OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/,'');
 const log = (...a)=> (DEBUG==='1'?console.log(...a):void 0);
 
 /* =============== util =============== */
@@ -80,21 +77,7 @@ async function withRetry(fn,label='動作',tries=4,baseMs=600){
   } throw last;
 }
 
-/* =============== 黑名單（禁止政治） =============== */
-const DEFAULT_BLACKLIST = [
-  '政治','選舉','大選','總統','立委','立法委員','立法院','國會','政黨','藍白','藍綠','藍營','綠營',
-  '民進黨','國民黨','民眾黨','時代力量','台獨','統一','公投','藍白合','賴清德','侯友宜','柯文哲','朱立倫',
-  '韓國瑜','立委補選','內閣','部長','政見','輔選','造勢','罷免','政爭'
-];
-const USER_BLACKLIST = (KEYWORD_BLACKLIST||'').split(',').map(s=>s.trim()).filter(Boolean);
-const ALL_BAD = new Set([...DEFAULT_BLACKLIST, ...USER_BLACKLIST]);
-const isBlack = (t='') => {
-  const s=(t||'').toLowerCase();
-  for(const k of ALL_BAD){ if(k && s.includes(k.toLowerCase())) return true; }
-  return false;
-};
-
-/* =============== RSS & ETtoday 熱門抓取 =============== */
+/* =============== RSS =============== */
 const DEFAULT_FEEDS = [
   'https://news.google.com/rss?hl=zh-TW&gl=TW&ceid=TW:zh-Hant',
   'https://feeds.bbci.co.uk/news/world/rss.xml',
@@ -104,73 +87,32 @@ const parser=new Parser({
   headers:{'User-Agent':'Mozilla/5.0','Accept':'application/rss+xml,application/xml;q=0.9,*/*;q=0.8'},
 });
 
-// ETtoday 熱門：直接抓頁面
-const ET_HOT = 'https://www.ettoday.net/news/hot-news.htm';
-async function fetchEttodayHotItems(){
-  const html = await withRetry(async ()=>{
-    const r = await axios.get(ET_HOT, {headers:{'User-Agent':'Mozilla/5.0'}});
-    if(r.status>=200 && r.status<300) return r.data;
-    throw new Error('ETtoday 熱門取得失敗: '+r.status);
-  }, '抓取 ETtoday 熱門');
-  const items=[];
-  const seen=new Set();
-  // 1) 先用 title 屬性
-  let m;
-  const reTitle = /<a[^>]+href="(\/news\/\d+\/[^"]+?)"[^>]*?title="([^"]{6,120})"[^>]*?>/g;
-  while((m=reTitle.exec(html))!==null){
-    const link='https://www.ettoday.net'+m[1];
-    const title=m[2].replace(/\s+/g,' ').trim();
-    const key=link;
-    if(!seen.has(key) && !isBlack(title)){
-      seen.add(key); items.push({title, link});
-    }
-  }
-  // 2) 再補沒有 title 的 a 文字
-  const reText = /<a[^>]+href="(\/news\/\d+\/[^"]+?)"[^>]*>(?:<[^>]*>)*([^<>]{6,120})<\/a>/g;
-  while((m=reText.exec(html))!==null){
-    const link='https://www.ettoday.net'+m[1];
-    const title=(m[2]||'').replace(/\s+/g,' ').trim();
-    const key=link;
-    if(title && !seen.has(key) && !isBlack(title)){
-      seen.add(key); items.push({title, link});
-    }
-  }
-  return items;
-}
+// 政治黑名單（只用於 RSS 過濾，避免政治類新聞）
+const POLITICS_BLOCK = /(政治|選舉|總統|立法院|政黨|國會|議員|內閣|部長|罷免|公投|藍營|綠營|藍白|兩岸|統獨|外交|國防|國安|國臺辦|台獨|一國兩制|國民黨|民進黨|時力|基進|親民黨|民眾黨)/i;
 
-async function pickFromRSS(){
+async function pickOneFeedItem(){
   const FEEDS=(FEED_URLS||'').split(',').map(s=>s.trim()).filter(Boolean);
   const sources=FEEDS.length?FEEDS:DEFAULT_FEEDS;
+  const store=readStore(); const seen=new Set(store.items.map(x=>x.hash));
   for(const url of sources){
     try{
       const feed=await parser.parseURL(url);
       for(const item of (feed.items||[])){
-        const title=(item.title||'').trim();
-        if(!title || isBlack(title)) continue;
-        const key=item.link||item.guid||title;
-        return {feedUrl:url,item:{title,link:item.link||'',contentSnippet:item.contentSnippet||item.content||''},hash:sha1(key)};
+        const key=item.link||item.guid||item.title||JSON.stringify(item);
+        const h=sha1(key);
+        if(seen.has(h)) continue;
+        if(await wpAlreadyPostedByTitle(item.title || '')) continue;
+
+        // 黑名單：標題或摘要含政治關鍵字 → 跳過
+        const ttl = item.title || '';
+        const snip = item.contentSnippet || item.content || '';
+        if (POLITICS_BLOCK.test(ttl) || POLITICS_BLOCK.test(snip)) continue;
+
+        return {feedUrl:url,item,hash:h};
       }
     }catch(e){ explainError(e,'讀取RSS失敗 '+url); }
   }
   return null;
-}
-
-async function pickOneFeedItem(){
-  const store=readStore(); const seen=new Set(store.items.map(x=>x.hash));
-  // 1) 先試 ETtoday 熱門
-  try{
-    const etItems = await fetchEttodayHotItems();
-    for(const it of etItems){
-      const h=sha1(it.link);
-      if(seen.has(h)) continue;
-      if(await wpAlreadyPostedByTitle(it.title||'')) continue;
-      return {feedUrl:ET_HOT, item:{title:it.title, link:it.link, contentSnippet:''}, hash:h};
-    }
-  }catch(e){ explainError(e,'ETtoday 熱門解析失敗（改走 RSS 回退）'); }
-
-  // 2) 再回退到 RSS
-  const r = await pickFromRSS();
-  return r;
 }
 
 /* =============== OpenAI =============== */
@@ -206,7 +148,7 @@ function extractJSON(text){
   try{ return JSON.parse(text); }catch{ return null; }
 }
 
-/* =============== 清理、去重（保持版型不變） =============== */
+/* =============== 清理 & 標題去重 =============== */
 const URL_RE=/\bhttps?:\/\/[^\s<>"'）)]+/gi;
 const WWW_RE=/\bwww\.[^\s<>"'）)]+/gi;
 const BAD_H2_RE=/(來源|出處|延伸閱讀|參考資料|傳送門|原文|全文|更多)/i;
@@ -233,44 +175,66 @@ function sanitizeDraft(d){
   return out;
 }
 
-// 去掉開頭與第一小標內容重複（僅做內容去重，不改你版型）
-function grams2(s){ const a=[]; const t=(s||'').replace(/\s+/g,''); for(let i=0;i<t.length-1;i++) a.push(t.slice(i,i+2)); return a; }
-function simRatio(a,b){
-  const A=new Set(grams2(a)), B=new Set(grams2(b));
-  if(A.size===0 || B.size===0) return 0;
-  let inter=0; for(const x of A){ if(B.has(x)) inter++; }
-  return inter / Math.min(A.size, B.size);
-}
-function dedupIntroVsFirstSection(draft){
-  const intro = (draft.intro_paragraphs||[]).join(' ');
-  if(!draft.sections || !draft.sections.length) return draft;
-  const first = draft.sections[0];
-  const firstText = (first.paragraphs||[]).slice(0,2).join(' ');
-  const ratio = simRatio(intro, firstText);
-  // 拿掉第一段（若過度相似），但至少保留一段
-  if(ratio >= 0.7 && first.paragraphs && first.paragraphs.length > 1){
-    first.paragraphs.shift();
-  }
-  // 也把「哈囉，大家好，我是文樂」從段落內文移除（只保留在前言開頭）
-  draft.sections.forEach(sec=>{
-    sec.paragraphs = (sec.paragraphs||[]).map(p => p.replace(/^哈囉，大家好，我是文樂。?/,'').trim()).filter(Boolean);
-  });
-  return draft;
-}
-
 function normalizeTitle(s){ return (s||'').toLowerCase().replace(/[^\u4e00-\u9fff\w]/g,''); }
 async function ensureUniqueTitle(srcTitle, modelTitle){
   let t=modelTitle||'';
   const a=normalizeTitle(srcTitle), b=normalizeTitle(t);
   if(!t || a===b || a.includes(b) || b.includes(a)){
-    const sys='你是資深中文標題編輯，請產出一個**與提供標題不同**、中立可讀、12–24字的新標題。只輸出標題。';
+    const sys='你是資深中文標題編輯，請產出一個**與提供標題不同**、中立、可讀性高、12–24字的中文新標題。只輸出標題文字。';
     t = await chatText(sys, `提供標題：${srcTitle}`, 'OpenAI 標題改寫');
     t = (t||'').replace(/\n/g,'').trim();
   }
   return t || srcTitle;
 }
 
-/* =============== 長文生成（禁止來源與網址） =============== */
+/* === 關鍵修正：確保第一段內容≠開頭，且不含「我是文樂」 === */
+function sameText(a, b) {
+  const x = (a || '').replace(/\s+/g, '').slice(0, 60);
+  const y = (b || '').replace(/\s+/g, '').slice(0, 60);
+  return x && y && (x === y || x.includes(y) || y.includes(x));
+}
+function norm(s=''){
+  return s.normalize('NFKC')
+          .replace(/[\p{P}\p{S}\s]/gu,'')
+          .toLowerCase();
+}
+function highOverlap(a='', b=''){
+  const x = norm(a), y = norm(b);
+  if (!x || !y) return false;
+  if (x.length < 30 && y.length < 30) return false;
+  if (x.length > y.length) return y && x.includes(y);
+  return x && y.includes(x);
+}
+function adjustFirstBlock(d){
+  if (!d?.sections?.length) return d;
+
+  // 處理小標題：不得含「我是文樂」，且不能與開頭重複
+  const helloRe = /哈囉，?大家好，?我是文樂/;
+  const introText = (d.intro_paragraphs||[]).join('\n').trim();
+  const sec0 = d.sections[0];
+
+  if (!sec0.heading || helloRe.test(sec0.heading) || sameText(sec0.heading, introText)) {
+    sec0.heading = '事件重點';
+  }
+  // 刪除第一節與開頭過度相似/重複的段落；並移除任何「我是文樂」
+  const nIntro = norm(introText);
+  sec0.paragraphs = (sec0.paragraphs||[])
+    .map(p => (p || '').replace(helloRe, '').trim())
+    .filter(p => {
+      const n = norm(p);
+      if (!n) return false;
+      if (nIntro && (highOverlap(n, nIntro) || sameText(p, introText))) return false;
+      return true;
+    });
+
+  // 若被清空，補一段簡短摘要，避免與其它段落互動
+  if (!sec0.paragraphs.length) {
+    sec0.paragraphs = ['重點整理：本文將依序梳理事件背景、最新進展與可能影響，供讀者快速掌握脈絡。'];
+  }
+  return d;
+}
+
+/* =============== 長文生成 =============== */
 async function writeLongArticle({title,link,snippet}){
   const sys=`你是繁體中文（台灣）新聞專欄編輯。請依「標題與摘要」寫出 3000–3600 字可直接發布的文章草稿：
 - 用自己的話改寫與延伸，資訊密度高、結構清楚，口吻中立。
@@ -283,7 +247,7 @@ async function writeLongArticle({title,link,snippet}){
 - 不要加任何解釋或程式碼框。`;
 
   const usr=`標題：${title}
-摘要：${snippet || '(RSS / 熱門無摘要)'}`;
+摘要：${snippet || '(RSS 無摘要)'}`;
 
   let txt; try{ txt=await chatText(sys, usr, 'OpenAI 文字生成(初次)'); }
   catch(e){ explainError(e,'OpenAI 文字生成失敗(初次)'); throw e; }
@@ -294,9 +258,7 @@ async function writeLongArticle({title,link,snippet}){
     let fix=''; try{ fix=await chatText(fixSys, txt, 'OpenAI JSON修復'); }catch(e){ explainError(e,'OpenAI JSON修復失敗'); }
     data=extractJSON(fix); if(!data) throw new Error('最終仍無法解析 JSON');
   }
-  data = sanitizeDraft(data);
-  data = dedupIntroVsFirstSection(data);
-  return data;
+  return adjustFirstBlock(sanitizeDraft(data));
 }
 
 /* =============== 產圖（封面可疊字） =============== */
@@ -410,7 +372,7 @@ async function wpAlreadyPostedByTitle(title){
   }catch{ return false; }
 }
 
-/* =============== Gutenberg blocks（保持你原本版型） =============== */
+/* =============== Gutenberg blocks（左對齊、薄背景） =============== */
 function h2Block(text){
   return `<!-- wp:heading {"textAlign":"left","style":{"spacing":{"padding":{"top":"8px","right":"12px","bottom":"8px","left":"12px"}},"typography":{"lineHeight":"1.2"},"border":{"radius":"8px"},"color":{"background":"#0a2a70","text":"#ffffff"}},"className":"wl-section"} -->
 <h2 class="wp-block-heading has-text-align-left wl-section" style="background-color:#0a2a70;color:#ffffff;border-radius:8px;line-height:1.2;padding:8px 12px;"><strong>${text}</strong></h2>
@@ -479,13 +441,14 @@ async function preflight(){
 async function runOnce(){
   console.log('▶ 開始一次任務');
   const picked=await pickOneFeedItem();
-  if(!picked){ console.log('⚠ 沒有新的 RSS / 熱門文章'); return; }
+  if(!picked){ console.log('⚠ 沒有新的 RSS 文章'); return; }
   const {item,hash,feedUrl}=picked; log('來源',feedUrl,'→',item.title);
 
   const draft=await writeLongArticle({
     title:item.title||'', link:item.link||'', snippet:item.contentSnippet||item.content||''
   });
 
+  // 確保標題改寫且不等於來源
   const catchyTitle = await ensureUniqueTitle(item.title||'', draft.catchy_title||item.title||'');
   const focusKeyword= draft.focus_keyword || (catchyTitle.split(' ')[0]) || '熱門新聞';
   const heroText    = draft.hero_text || catchyTitle;
@@ -506,6 +469,7 @@ async function runOnce(){
     title:catchyTitle, content:contentBlocks, excerpt:focusKeyword, featured_media:mediaA.id, focus_kw:focusKeyword
   });
 
+  // 標籤
   try{
     const tagLine=await chatText(
       '請用繁體中文回覆三個貼切的標籤，僅用中文逗號或頓號分隔，禁止加引號與任何說明。',
