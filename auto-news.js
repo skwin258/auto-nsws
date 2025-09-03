@@ -87,7 +87,7 @@ const parser=new Parser({
   headers:{'User-Agent':'Mozilla/5.0','Accept':'application/rss+xml,application/xml;q=0.9,*/*;q=0.8'},
 });
 
-// 👉 政治黑名單（只用於 RSS 過濾，避免政治類新聞）
+// 政治黑名單（只用於 RSS 過濾，避免政治類新聞）
 const POLITICS_BLOCK = /(政治|選舉|總統|立法院|政黨|國會|議員|內閣|部長|罷免|公投|藍營|綠營|藍白|兩岸|統獨|外交|國防|國安|國臺辦|台獨|一國兩制|國民黨|民進黨|時力|基進|親民黨|民眾黨)/i;
 
 async function pickOneFeedItem(){
@@ -103,7 +103,7 @@ async function pickOneFeedItem(){
         if(seen.has(h)) continue;
         if(await wpAlreadyPostedByTitle(item.title || '')) continue;
 
-        // 👉 新增：標題/摘要含政治關鍵字就跳過
+        // 黑名單：標題或摘要含政治關鍵字 → 跳過
         const ttl = item.title || '';
         const snip = item.contentSnippet || item.content || '';
         if (POLITICS_BLOCK.test(ttl) || POLITICS_BLOCK.test(snip)) continue;
@@ -187,25 +187,49 @@ async function ensureUniqueTitle(srcTitle, modelTitle){
   return t || srcTitle;
 }
 
-// 👉 新增：避免第一個小標題與開頭重複或含「我是文樂」
+/* === 關鍵修正：確保第一段內容≠開頭，且不含「我是文樂」 === */
 function sameText(a, b) {
-  const x = (a || '').replace(/\s+/g, '').slice(0, 20);
-  const y = (b || '').replace(/\s+/g, '').slice(0, 20);
+  const x = (a || '').replace(/\s+/g, '').slice(0, 60);
+  const y = (b || '').replace(/\s+/g, '').slice(0, 60);
   return x && y && (x === y || x.includes(y) || y.includes(x));
 }
-function adjustFirstHeading(d) {
+function norm(s=''){
+  return s.normalize('NFKC')
+          .replace(/[\p{P}\p{S}\s]/gu,'')
+          .toLowerCase();
+}
+function highOverlap(a='', b=''){
+  const x = norm(a), y = norm(b);
+  if (!x || !y) return false;
+  if (x.length < 30 && y.length < 30) return false;
+  if (x.length > y.length) return y && x.includes(y);
+  return x && y.includes(x);
+}
+function adjustFirstBlock(d){
   if (!d?.sections?.length) return d;
-  const helloRe = /哈囉，?大家好，?我是文樂/;
-  const introFirst = (d.intro_paragraphs?.[0] || '').trim();
-  const first = d.sections[0];
 
-  if (!first.heading || helloRe.test(first.heading) || sameText(first.heading, introFirst)) {
-    first.heading = '事件重點';
+  // 處理小標題：不得含「我是文樂」，且不能與開頭重複
+  const helloRe = /哈囉，?大家好，?我是文樂/;
+  const introText = (d.intro_paragraphs||[]).join('\n').trim();
+  const sec0 = d.sections[0];
+
+  if (!sec0.heading || helloRe.test(sec0.heading) || sameText(sec0.heading, introText)) {
+    sec0.heading = '事件重點';
   }
-  if (Array.isArray(first.paragraphs) && first.paragraphs.length) {
-    first.paragraphs = first.paragraphs
-      .map(p => (p || '').replace(helloRe, '').trim())
-      .filter(Boolean);
+  // 刪除第一節與開頭過度相似/重複的段落；並移除任何「我是文樂」
+  const nIntro = norm(introText);
+  sec0.paragraphs = (sec0.paragraphs||[])
+    .map(p => (p || '').replace(helloRe, '').trim())
+    .filter(p => {
+      const n = norm(p);
+      if (!n) return false;
+      if (nIntro && (highOverlap(n, nIntro) || sameText(p, introText))) return false;
+      return true;
+    });
+
+  // 若被清空，補一段簡短摘要，避免與其它段落互動
+  if (!sec0.paragraphs.length) {
+    sec0.paragraphs = ['重點整理：本文將依序梳理事件背景、最新進展與可能影響，供讀者快速掌握脈絡。'];
   }
   return d;
 }
@@ -234,8 +258,7 @@ async function writeLongArticle({title,link,snippet}){
     let fix=''; try{ fix=await chatText(fixSys, txt, 'OpenAI JSON修復'); }catch(e){ explainError(e,'OpenAI JSON修復失敗'); }
     data=extractJSON(fix); if(!data) throw new Error('最終仍無法解析 JSON');
   }
-  // 👉 只在清理後補強第一個小標題
-  return adjustFirstHeading(sanitizeDraft(data));
+  return adjustFirstBlock(sanitizeDraft(data));
 }
 
 /* =============== 產圖（封面可疊字） =============== */
